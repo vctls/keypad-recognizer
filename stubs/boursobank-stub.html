@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stub — BoursoBank clavier virtuel (sasmap)</title>
+<!--
+  Offline test fixture reproducing the BoursoBank "sasmap" shuffled-keypad
+  password screen (https://clients.boursobank.com/connexion/saisie-mot-de-passe).
+
+  Fidelity to the real page (what the userscript keys off of):
+    - <div class="sasmap"> containing 10 <button class="sasmap__key" data-matrix-key="XXX">
+    - each button holds <img class="sasmap__img" src="data:image/svg+xml;base64,...">  (digit as SVG)
+    - the data-matrix-key token is a random 3-letter string, remapped every load
+    - digit <-> position <-> token are all shuffled
+    - a masked "dots" display, a backspace (Effacer) button, and a "Se connecter" submit
+
+  Test affordances (NOT in the real page):
+    - Ground truth is known. window.__stub__ exposes the current token->digit map,
+      the entered digits, and the expected password.
+    - On submit, the decoded password is shown in #result and stored in
+      window.__stub__.entered, and a pass/fail vs the expected password is shown.
+    - URL params:
+        ?expected=12345678   set the password the stub should receive (default 12345678)
+        ?len=8               number of digits (default 8)
+        ?reshuffle=1500      reshuffle the keypad every 1500 ms (default: off)
+        ?reshuffle=keypress  reshuffle after every digit press
+      These let us test the replayer's "re-scan before each click" requirement.
+-->
+<style>
+  :root { --navy:#003883; --pink:#d6006e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Arial, Helvetica, sans-serif; background:#eef3fb;
+         display:flex; justify-content:center; padding:32px 16px; }
+  .card { background:#fff; width:520px; max-width:100%; border-radius:10px;
+          box-shadow:0 6px 24px rgba(0,0,0,.08); border-top:6px solid var(--pink);
+          padding:28px 28px 36px; }
+  h1 { color:var(--navy); text-align:center; font-size:26px; margin:8px 0 4px; }
+  .sub { color:#6a7a90; text-align:center; font-size:13px; margin:0 0 16px; }
+  .addr { display:block; margin:0 auto 20px; width:max-content; border:1px solid #d5dce6;
+          border-radius:20px; padding:6px 14px; color:#333; font-size:13px; }
+  .dots { display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:18px; }
+  .dot { width:14px; height:14px; border-radius:50%; border:1.5px solid #b9c4d4; }
+  .dot.filled { background:var(--navy); border-color:var(--navy); }
+  .erase { border:1.5px solid var(--navy); background:#fff; color:var(--navy);
+           border-radius:8px; width:40px; height:28px; cursor:pointer; font-size:16px; }
+  .sasmap { display:grid; grid-template-columns:repeat(5,1fr); gap:14px 12px;
+            margin:6px auto 22px; width:max-content; }
+  .sasmap__key { width:64px; height:64px; border-radius:50%; border:1px solid #e2e8f2;
+                 background:#fff; box-shadow:0 2px 6px rgba(0,0,0,.06); cursor:pointer;
+                 display:flex; align-items:center; justify-content:center; padding:0;
+                 touch-action:pan-y; user-select:none; -webkit-user-drag:none;
+                 -webkit-tap-highlight-color:rgba(0,0,0,0); }
+  .sasmap__key:active { background:#f0f4fa; }
+  .sasmap__img { width:42px; height:42px; pointer-events:none; }
+  .connect { display:block; width:70%; margin:6px auto 14px; border:0; cursor:pointer;
+             background:linear-gradient(90deg,#d6006e,#ff2e8a); color:#fff;
+             font-weight:bold; font-size:16px; padding:14px; border-radius:26px; }
+  #result { text-align:center; font-family: monospace; font-size:14px; min-height:20px; }
+  .ok { color:#087a3f; } .bad { color:#c01515; }
+  .hint { text-align:center; color:#9aa7b8; font-size:11px; margin-top:14px; }
+</style>
+</head>
+<body>
+  <!-- Priming field for password managers. The real BoursoBank login ships a client-number
+       field present at load, which makes managers like KeePassXC fully activate detection on
+       their first page scan. Without any *visible* field at load the manager degrades to a
+       single ~2s retry then gives up, so it wires our dynamically injected #kr-input only
+       intermittently (the manager's scan filters out display:none / zero-size / type=hidden
+       fields, so this must be genuinely visible — kept small and labelled as a fixture bit). -->
+  <label style="position:fixed;top:6px;left:6px;font:10px system-ui;color:#9aa7b8;opacity:.85;z-index:1">n° client (fixture)
+    <input type="text" name="form[clientNumber]" autocomplete="username" aria-label="Numéro client"
+           style="width:120px;height:20px;font:11px system-ui;border:1px solid #cdd5e0;border-radius:4px">
+  </label>
+
+  <main class="card">
+    <h1>Mon mot de passe</h1>
+    <p class="sub">Veuillez toujours vérifier que vous êtes sur la bonne adresse</p>
+    <span class="addr">🔒 clients.boursobank.com <em>(STUB)</em></span>
+
+    <div class="dots">
+      <div id="dots" style="display:flex;gap:12px"></div>
+      <button class="erase" type="button" id="erase"
+              aria-label="Effacer un chiffre du mot de passe saisi">⌫</button>
+    </div>
+
+    <div class="sasmap" id="sasmap" role="group" aria-label="Clavier virtuel"></div>
+
+    <button class="connect" type="button" id="connect">Se connecter</button>
+    <div id="result"></div>
+    <p class="hint">Fixture de test — params: ?expected= &amp; ?len= &amp; ?reshuffle=1500|keypress</p>
+  </main>
+
+<script>
+(() => {
+  "use strict";
+
+  // --- Canonical digit glyphs, captured from the live BoursoBank sasmap keypad. ---
+  const GLYPH = {
+    0: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxwYXRoIGQ9Im0yMS41IDZjNC42IDAgNi40IDQuOCA2LjQgOC45cy0xLjggOC45LTYuNCA4LjljLTQuNyAwLTYuNC00LjgtNi40LTguOXMxLjgtOC45IDYuNC04Ljl6bTAgMS40Yy0zLjYgMC00LjggNC00LjggNy42IDAgMy41IDEuMiA3LjYgNC44IDcuNnM0LjgtNCA0LjgtNy42LTEuMi03LjYtNC44LTcuNnoiIGZpbGw9IiMwMDM4ODMiLz48L3N2Zz4=",
+    1: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxwYXRoIGQ9Im0yMC44IDguMy0yLjggMy0uOS0xIDMuOC00aDEuM3YxNy4zaC0xLjV2LTE1LjN6IiBmaWxsPSIjMDAzODgzIi8+PC9zdmc+",
+    2: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im0xMy45IDM1LjloLTMuNmwtLjYgMS42aC0xbDIuOS03LjJoMS4xbDIuOSA3LjJoLTF6bS0zLjMtLjhoM2wtMS41LTMuOXoiLz48cGF0aCBkPSJtMTguNyAzMC4zaDMuMmMxLjIgMCAyIC44IDIgMS44IDAgLjktLjYgMS41LTEuMyAxLjYuOC4xIDEuNC45IDEuNCAxLjggMCAxLjItLjggMS45LTIuMSAxLjloLTMuM3YtNy4xem0zIDMuMWMuOCAwIDEuMi0uNSAxLjItMS4yIDAtLjYtLjQtMS4yLTEuMi0xLjJoLTIuMnYyLjNoMi4yem0wIDMuM2MuOCAwIDEuMy0uNSAxLjMtMS4ycy0uNS0xLjItMS4zLTEuMmgtMi4ydjIuNWgyLjJ6Ii8+PHBhdGggZD0ibTI3LjMgMzMuOWMwLTIuMiAxLjYtMy43IDMuNy0zLjcgMS4zIDAgMi4yLjYgMi43IDEuNGwtLjguNGMtLjQtLjYtMS4yLTEtMi0xLTEuNiAwLTIuOCAxLjItMi44IDIuOXMxLjIgMi45IDIuOCAyLjljLjggMCAxLjYtLjQgMi0xbC44LjRjLS42LjgtMS41IDEuNC0yLjcgMS40LTIuMSAwLTMuNy0xLjUtMy43LTMuN3oiLz48L2c+PHBhdGggZD0ibTE1LjkgMjIuM2M1LjktNC43IDkuOC04LjEgOS44LTExLjQgMC0yLjUtMi0zLjUtMy45LTMuNS0yLjEgMC0zLjguOS00LjcgMi4zbC0xLS45YzEuMi0xLjggMy4zLTIuOCA1LjctMi44IDIuNSAwIDUuNCAxLjQgNS40IDQuOSAwIDMuOC00IDcuMy05IDExLjNoOS4xdjEuM2gtMTEuNHoiLz48L2c+PC9zdmc+",
+    3: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im0xMC4yIDMwLjNoMi41YzIuMiAwIDMuNyAxLjYgMy43IDMuNnMtMS41IDMuNi0zLjcgMy42aC0yLjV6bTIuNSA2LjRjMS43IDAgMi44LTEuMiAyLjgtMi44IDAtMS41LTEtMi44LTIuOC0yLjhoLTEuNnY1LjZ6Ii8+PHBhdGggZD0ibTE5LjkgMzAuM2g0Ljd2LjhoLTMuOHYyLjNoMy43di44aC0zLjd2Mi41aDMuOHYuOGgtNC43eiIvPjxwYXRoIGQ9Im0yOC4xIDMwLjNoNC43di44aC0zLjh2Mi4zaDMuN3YuOGgtMy43djMuM2gtLjl6Ii8+PC9nPjxwYXRoIGQ9Im0xNi4zIDIwLjFjMSAxLjQgMi42IDIuNCA0LjggMi40IDIuNyAwIDQuMy0xLjQgNC4zLTMuNyAwLTIuNS0yLTMuNS00LjYtMy41LS43IDAtMS4zIDAtMS42IDB2LTEuM2gxLjZjMi4zIDAgNC40LTEgNC40LTMuMyAwLTIuMS0xLjktMy4zLTQuMS0zLjMtMiAwLTMuNC44LTQuNiAyLjJsLS45LS45YzEuMi0xLjUgMy4xLTIuNyA1LjYtMi43IDMgMCA1LjYgMS42IDUuNiA0LjYgMCAyLjYtMi4yIDMuOC0zLjcgNCAxLjUuMiA0IDEuNCA0IDQuM3MtMi4xIDQuOS01LjggNC45Yy0yLjggMC00LjktMS4zLTUuOS0yLjl6Ii8+PC9nPjwvc3ZnPg==",
+    4: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im0xMy42IDMwLjJjMS4zIDAgMi4yLjYgMi44IDEuM2wtLjcuNWMtLjUtLjYtMS4yLTEtMi4xLTEtMS42IDAtMi44IDEuMi0yLjggMi45czEuMiAyLjkgMi44IDIuOWMuOSAwIDEuNi0uNCAxLjktLjh2LTEuNWgtMi41di0uOGgzLjR2Mi42Yy0uNy43LTEuNiAxLjItMi44IDEuMi0yIDAtMy43LTEuNS0zLjctMy43czEuNy0zLjYgMy43LTMuNnoiLz48cGF0aCBkPSJtMjUuMSAzNC4yaC00LjJ2My4zaC0uOXYtNy4yaC45djMuMWg0LjJ2LTMuMWguOXY3LjJoLS45eiIvPjxwYXRoIGQ9Im0yOS44IDMwLjNoLjl2Ny4yaC0uOXoiLz48L2c+PHBhdGggZD0ibTIzLjYgMTguOGgtOC4ydi0xLjNsNy43LTExLjJoMnYxMS4yaDIuNXYxLjNoLTIuNXY0LjdoLTEuNXptLTYuNy0xLjNoNi43di05Ljd6Ii8+PC9nPjwvc3ZnPg==",
+    5: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im0xMS42IDM2LjFjLjMuNC43LjcgMS40LjcuOSAwIDEuNC0uNiAxLjQtMS41di01aC45djVjMCAxLjYtMSAyLjMtMi4zIDIuMy0uOCAwLTEuNC0uMi0xLjktLjh6Ii8+PHBhdGggZD0ibTIwLjcgMzQuMy0uNy44djIuNGgtLjl2LTcuMmguOXYzLjdsMy4yLTMuN2gxLjFsLTMgMy40IDMuMiAzLjhoLTEuMXoiLz48cGF0aCBkPSJtMjcuNyAzMC4zaC45djYuNGgzLjR2LjhoLTQuMnYtNy4yeiIvPjwvZz48cGF0aCBkPSJtMTcuNCAyMC4xYzEuMSAxLjYgMi42IDIuNSA0LjggMi41IDIuNSAwIDQuMy0xLjggNC4zLTQuMiAwLTIuNi0xLjgtNC4yLTQuMy00LjItMS42IDAtMi45LjUtNC4yIDEuN2wtMS0uNnYtOWgxMHYxLjNoLTguNXY2LjhjLjktLjggMi4zLTEuNiA0LjEtMS42IDIuOSAwIDUuNSAxLjkgNS41IDUuNSAwIDMuNC0yLjYgNS42LTUuOCA1LjYtMi45IDAtNC42LTEuMS01LjgtMi44eiIvPjwvZz48L3N2Zz4=",
+    6: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im0xMy45IDMxLjYtMi40IDUuOWgtLjRsLTIuNC01Ljl2NS45aC0uOXYtNy4yaDEuM2wyLjIgNS40IDIuMi01LjRoMS4zdjcuMmgtLjl6Ii8+PHBhdGggZD0ibTE5LjUgMzEuOHY1LjdoLS45di03LjJoLjlsNC4xIDUuNnYtNS42aC45djcuMmgtLjl6Ii8+PHBhdGggZD0ibTMxLjcgMzAuMmMyLjEgMCAzLjYgMS42IDMuNiAzLjdzLTEuNCAzLjctMy42IDMuN2MtMi4xIDAtMy42LTEuNi0zLjYtMy43czEuNC0zLjcgMy42LTMuN3ptMCAuOGMtMS43IDAtMi43IDEuMi0yLjcgMi45czEgMi45IDIuNiAyLjkgMi42LTEuMiAyLjYtMi45Yy4xLTEuNy0uOS0yLjktMi41LTIuOXoiLz48L2c+PHBhdGggZD0ibTIyLjYgNmMyLjMgMCAzLjYuOSA0LjcgMi4ybC0uOSAxLjFjLS44LTEuMS0xLjktMS45LTMuOC0xLjktMy43IDAtNS4xIDMuOS01LjEgNy42di44Yy43LTEuMiAyLjctMi45IDUtMi45IDMuMSAwIDUuNiAxLjggNS42IDUuNSAwIDIuOC0yLjEgNS41LTUuOCA1LjUtNC43IDAtNi4zLTQuMy02LjMtOC45IDAtNC41IDEuOC05IDYuNi05em0tLjMgOC4yYy0xLjkgMC0zLjcgMS4yLTQuNyAzIC4yIDIuNCAxLjQgNS40IDQuNyA1LjQgMyAwIDQuMy0yLjMgNC4zLTQuMSAwLTIuOS0xLjgtNC4zLTQuMy00LjN6Ii8+PC9nPjwvc3ZnPg==",
+    7: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im01IDMwLjRoMi45YzEuNCAwIDIuMiAxIDIuMiAyLjJzLS44IDIuMi0yLjIgMi4yaC0ydjIuOWgtLjl6bTIuOC44aC0xLjl2Mi44aDEuOWMuOSAwIDEuNC0uNiAxLjQtMS40cy0uNS0xLjQtMS40LTEuNHoiLz48cGF0aCBkPSJtMTkuMyAzNi43LjcuNy0uNi41LS43LS43Yy0uNS4zLTEuMi41LTEuOS41LTIuMSAwLTMuNi0xLjYtMy42LTMuN3MxLjQtMy43IDMuNi0zLjdjMi4xIDAgMy42IDEuNiAzLjYgMy43LS4xIDEuMS0uNCAyLTEuMSAyLjd6bS0xLjItLjEtMS0xLjEuNi0uNSAxIDEuMWMuNC0uNS43LTEuMi43LTIgMC0xLjctMS0yLjktMi42LTIuOXMtMi42IDEuMi0yLjYgMi45IDEgMi45IDIuNiAyLjljLjUtLjEuOS0uMiAxLjMtLjR6Ii8+PHBhdGggZD0ibTI2LjIgMzQuOGgtMS40djIuOWgtLjl2LTcuMmgyLjljMS4zIDAgMi4yLjggMi4yIDIuMiAwIDEuMy0uOSAyLTEuOSAyLjFsMS45IDIuOWgtMXptLjQtMy42aC0xLjl2Mi44aDEuOWMuOCAwIDEuNC0uNiAxLjQtMS40LjEtLjgtLjUtMS40LTEuNC0xLjR6Ii8+PHBhdGggZD0ibTMyLjcgMzUuOWMuNS41IDEuMiAxIDIuMyAxIDEuMyAwIDEuNy0uNyAxLjctMS4yIDAtLjktLjktMS4xLTEuOC0xLjQtMS4yLS4zLTIuNC0uNi0yLjQtMiAwLTEuMiAxLjEtMiAyLjUtMiAxLjEgMCAxLjkuNCAyLjUgMWwtLjcuN2MtLjUtLjYtMS4zLS45LTIuMS0uOS0uOSAwLTEuNS41LTEuNSAxLjEgMCAuNy44LjkgMS43IDEuMiAxLjIuMyAyLjUuNyAyLjUgMi4yIDAgMS0uNyAyLjEtMi42IDIuMS0xLjIgMC0yLjItLjUtMi44LTEuMXoiLz48L2c+PHBhdGggZD0ibTI0LjkgNy42aC05LjV2LTEuM2gxMS4zdjFsLTcuNCAxNi4yaC0xLjZ6Ii8+PC9nPjwvc3ZnPg==",
+    8: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im0xMS44IDMxLjFoLTIuM3YtLjhoNS40di44aC0yLjN2Ni40aC0uOXYtNi40eiIvPjxwYXRoIGQ9Im0xOC4zIDMwLjNoLjl2NC40YzAgMS4zLjcgMi4xIDIgMi4xczItLjggMi0yLjF2LTQuNGguOXY0LjRjMCAxLjgtMSAyLjktMi45IDIuOXMtMi45LTEuMi0yLjktMi45eiIvPjxwYXRoIGQ9Im0yNy4yIDMwLjNoMWwyLjQgNi4yIDIuNC02LjJoMWwtMi45IDcuMmgtMS4xeiIvPjwvZz48cGF0aCBkPSJtMjAuMyAxNC43Yy0yLS41LTQtMS45LTQtNC4yIDAtMy4xIDIuOC00LjUgNS42LTQuNSAyLjcgMCA1LjYgMS40IDUuNiA0LjUgMCAyLjMtMiAzLjYtNCA0LjIgMi4yLjYgNC4zIDIuMiA0LjMgNC42IDAgMi44LTIuNSA0LjYtNS44IDQuNnMtNS45LTEuOC01LjktNC42Yy0uMS0yLjUgMi00LjEgNC4yLTQuNnptMS42LjZjLTEuMS4xLTQuNCAxLjItNC40IDMuOCAwIDIuMSAyLjEgMy40IDQuNCAzLjRzNC40LTEuMyA0LjQtMy40YzAtMi42LTMuNC0zLjYtNC40LTMuOHptMC03LjljLTIuMyAwLTQuMSAxLjItNC4xIDMuMyAwIDIuNCAzLjEgMy4yIDQuMSAzLjQgMS4xLS4yIDQuMS0xIDQuMS0zLjQgMC0yLjEtMS44LTMuMy00LjEtMy4zeiIvPjwvZz48L3N2Zz4=",
+    9: "data:image/svg+xml;base64,PHN2ZyBlbmFibGUtYmFja2dyb3VuZD0ibmV3IDAgMCA0MiA0MiIgdmlld0JveD0iMCAwIDQyIDQyIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxnIGZpbGw9IiMwMDM4ODMiPjxnIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXciPjxwYXRoIGQ9Im03LjYgMzEuNy0xLjYgNS44aC0xbC0yLTcuMmgxbDEuNiA2IDEuNi02aC44bDEuNiA2IDEuNi02aDFsLTIgNy4yaC0xeiIvPjxwYXRoIGQ9Im0xOCAzNC40LTIuMyAzLjFoLTEuMWwyLjgtMy43LTIuNi0zLjVoMS4xbDIuMSAyLjkgMi4xLTIuOWgxLjFsLTIuNiAzLjUgMi44IDMuN2gtMS4xeiIvPjxwYXRoIGQ9Im0yNi42IDM0LjUtMi44LTQuMWgxbDIuMiAzLjMgMi4yLTMuM2gxbC0yLjggNC4xdjNoLS45di0zeiIvPjxwYXRoIGQ9Im0zMy4xIDM2LjggNC01LjZoLTR2LS44aDUuMnYuN2wtNCA1LjZoNC4xdi44aC01LjJ2LS43eiIvPjwvZz48cGF0aCBkPSJtMTcuNyAyMC42Yy44IDEuMSAxLjkgMS45IDMuOCAxLjkgMy44IDAgNS4xLTQgNS4xLTcuNnYtLjhjLS44IDEuMi0yLjcgMi45LTUuMSAyLjktMy4xIDAtNS42LTEuOC01LjYtNS41LjEtMi44IDIuMi01LjUgNS45LTUuNSA0LjcgMCA2LjMgNC4zIDYuMyA4LjkgMCA0LjQtMS44IDguOS02LjYgOC45LTIuMyAwLTMuNi0uOS00LjYtMi4yem00LjEtMTMuMmMtMyAwLTQuMyAyLjMtNC4zIDQuMSAwIDIuOCAxLjkgNC4yIDQuMyA0LjIgMS45IDAgMy43LTEuMiA0LjctMy0uMi0yLjMtMS40LTUuMy00LjctNS4zeiIvPjwvZz48L3N2Zz4="
+  };
+
+  // --- Config from URL params ---
+  const q = new URLSearchParams(location.search);
+  const EXPECTED = (q.get("expected") || "12345678").replace(/\D/g, "");
+  const LEN = Math.max(1, parseInt(q.get("len") || String(EXPECTED.length) || "8", 10));
+  const reshuffleParam = q.get("reshuffle"); // null | "keypress" | milliseconds
+
+  // Non-crypto PRNG helpers (fine for a fixture).
+  const rand = (n) => Math.floor(Math.random() * n);
+  const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = rand(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+  const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const makeToken = (used) => { let t; do { t = LETTERS[rand(26)] + LETTERS[rand(26)] + LETTERS[rand(26)]; } while (used.has(t)); used.add(t); return t; };
+
+  const sasmap = document.getElementById("sasmap");
+  const dotsEl = document.getElementById("dots");
+  const resultEl = document.getElementById("result");
+
+  let tokenToDigit = {};   // ground truth for the CURRENT layout
+  let entered = [];        // array of digit chars entered so far
+
+  // Build / rebuild the shuffled keypad. Each rebuild = a fresh session-like matrix.
+  function renderKeypad() {
+    tokenToDigit = {};
+    const used = new Set();
+    const digits = shuffle([0,1,2,3,4,5,6,7,8,9]);
+    sasmap.innerHTML = "";
+    digits.forEach((d) => {
+      const token = makeToken(used);
+      tokenToDigit[token] = String(d);
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "sasmap__key";
+      btn.setAttribute("data-matrix-key", token);
+      btn.style.cssText = "touch-action:pan-y;user-select:none;-webkit-user-drag:none;-webkit-tap-highlight-color:rgba(0,0,0,0)";
+      const img = document.createElement("img");
+      img.alt = "";
+      img.className = "sasmap__img";
+      img.src = GLYPH[d];
+      btn.appendChild(img);
+      btn.addEventListener("click", () => onKey(token));
+      sasmap.appendChild(btn);
+    });
+    window.__stub__.tokenToDigit = tokenToDigit;
+  }
+
+  function renderDots() {
+    dotsEl.innerHTML = "";
+    for (let i = 0; i < LEN; i++) {
+      const dot = document.createElement("span");
+      dot.className = "dot" + (i < entered.length ? " filled" : "");
+      dotsEl.appendChild(dot);
+    }
+  }
+
+  function onKey(token) {
+    if (entered.length >= LEN) return;
+    const d = tokenToDigit[token];
+    entered.push(d);
+    window.__stub__.entered = entered.join("");
+    renderDots();
+    if (reshuffleParam === "keypress") renderKeypad();
+  }
+
+  function erase() {
+    entered.pop();
+    window.__stub__.entered = entered.join("");
+    renderDots();
+  }
+
+  function submit() {
+    const got = entered.join("");
+    window.__stub__.submitted = got;
+    const ok = got === EXPECTED;
+    resultEl.className = ok ? "ok" : "bad";
+    resultEl.textContent = ok
+      ? "✓ Reçu: " + got + " — correspond au mot de passe attendu."
+      : "✗ Reçu: \"" + got + "\" — attendu \"" + EXPECTED + "\".";
+  }
+
+  // Expose ground truth for automated assertions.
+  window.__stub__ = {
+    get tokenToDigit() { return tokenToDigit; },
+    set tokenToDigit(v) {},
+    entered: "",
+    submitted: null,
+    expected: EXPECTED,
+    len: LEN,
+    reset() { entered = []; window.__stub__.entered = ""; window.__stub__.submitted = null; resultEl.textContent = ""; renderDots(); renderKeypad(); }
+  };
+
+  document.getElementById("erase").addEventListener("click", erase);
+  document.getElementById("connect").addEventListener("click", submit);
+
+  renderKeypad();
+  renderDots();
+
+  if (reshuffleParam && reshuffleParam !== "keypress") {
+    const ms = parseInt(reshuffleParam, 10);
+    if (ms > 0) setInterval(renderKeypad, ms);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Offline test fixture reproducing the Hello bank! / BNP Paribas "cas" login screen
+  (https://connexion.hellobank.fr/as/authorization.oauth2…). Two live traits the userscript
+  tripped over, each guarded here:
+
+  1. STRICT `style-src` CSP (no 'unsafe-inline'). The real page sends
+        Content-Security-Policy: script-src 'strict-dynamic' 'nonce-…'; style-src 'nonce-…'
+     which makes the browser STRIP every `style="…"` attribute parsed from innerHTML. The panel
+     used to build its inner nodes from an innerHTML string with inline styles → they were dropped
+     → the panel rendered with UA defaults (transparent card, unstyled 16px button). The fix builds
+     each node's style via CSSOM (element.style), which `style-src` does not govern. The meta CSP
+     below reproduces the stripping (note: the fixture's own styling therefore lives in a NONCE'd
+     <style> block, and it uses NO inline style attributes).
+
+  2. A MULTI-STEP form that PRE-RENDERS the keypad step hidden and REVEALS it by toggling a class
+     — no DOM node is inserted. The detector's MutationObserver watched childList only, so the
+     reveal fired nothing and the keypad sat undetected. The fix also observes visibility-affecting
+     attribute changes (class/style/hidden/aria-hidden). The keypad here is a plain TEXT keypad
+     (digits in textContent), exactly like the live one (button.cas__btn--key in .cas__grid).
+
+  Test affordances (NOT in the real page): window.__stub__ exposes posToDigit, entered, submitted,
+  expected, reset(), regenerate(), and reveal() (equivalent to clicking "Continuer").
+  URL params: ?expected=  ?len=  ?reshuffle=<ms>|keypress
+-->
+<meta http-equiv="Content-Security-Policy" content="style-src 'nonce-krstub'">
+<title>Stub — Hello bank! clavier (multi-step, strict style-src CSP)</title>
+<style nonce="krstub">
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Arial, Helvetica, sans-serif; background:#fff; color:#12263f;
+         display:flex; justify-content:center; padding:40px 16px; }
+  .card { width:420px; max-width:100%; }
+  h1 { font-size:26px; margin:0 0 24px; color:#12263f; }
+  label { display:block; font-weight:bold; font-size:14px; margin-bottom:8px; }
+  .idfield { width:100%; height:44px; border:1px solid #c9d3df; border-radius:6px; padding:0 12px;
+             font-size:16px; margin-bottom:16px; }
+  .continue, .submit { width:100%; height:48px; border:0; border-radius:24px; cursor:pointer;
+             background:#00b0c7; color:#fff; font-weight:bold; font-size:16px; }
+  .hidden { display:none; }
+  .dots { display:flex; gap:10px; margin:8px 0 18px; }
+  .dot { width:34px; height:44px; border:1px solid #c9d3df; border-radius:6px; }
+  .dot.filled { border-color:#00b0c7; background:#eaf9fb; }
+  .cas__grid { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:22px; }
+  .cas__btn--key { height:69px; border:1px solid #d6dee8; border-radius:8px; background:#f4f7fa;
+             cursor:pointer; font-size:24px; font-weight:bold; color:#12263f; }
+  .cas__btn--key:active { background:#e4ebf2; }
+  .erase { height:69px; border:1px solid #d6dee8; border-radius:8px; background:#eef2f6;
+             cursor:pointer; font-size:22px; }
+  #result { font-family: monospace; font-size:14px; min-height:20px; margin-top:14px; }
+  .ok { color:#087a3f; } .bad { color:#c01515; }
+  .hint { color:#9aa7b8; font-size:11px; margin-top:20px; }
+</style>
+</head>
+<body class="cas">
+  <main class="card">
+    <h1>Accédez à votre espace client <em>(STUB)</em></h1>
+
+    <form id="identForm">
+      <fieldset id="stepId" class="cas__fieldset">
+        <label for="userId">Numéro Client</label>
+        <input id="userId" class="idfield" type="text" name="user_id" autocomplete="username"
+               inputmode="numeric" aria-label="Numéro client">
+        <button id="continuer" class="continue" type="button">Continuer</button>
+      </fieldset>
+
+      <fieldset id="stepPassword" class="cas__fieldset cas__fieldset--grid hidden" tabindex="-1">
+        <label>Saisissez votre code secret</label>
+        <div class="dots">
+          <div id="dots"></div>
+          <button class="erase" type="button" id="erase" aria-label="Effacer">✕</button>
+        </div>
+        <div class="cas__grid" id="grid-keyboard" role="group" aria-label="Clavier"></div>
+        <button class="submit" type="button" id="submit">Accéder à mon espace client</button>
+      </fieldset>
+    </form>
+
+    <div id="result"></div>
+    <p class="hint">Fixture — ?expected= &amp; ?len= &amp; ?reshuffle=1500|keypress</p>
+  </main>
+
+<script nonce="krstub">
+(() => {
+  "use strict";
+  const q = new URLSearchParams(location.search);
+  const EXPECTED = (q.get("expected") || "4602873159").replace(/\D/g, "");
+  const LEN = Math.max(1, parseInt(q.get("len") || EXPECTED.length, 10));
+  const reshuffleRaw = q.get("reshuffle");
+  const reshuffleMs = reshuffleRaw && reshuffleRaw !== "keypress" ? parseInt(reshuffleRaw, 10) : 0;
+  const reshuffleOnKey = reshuffleRaw === "keypress";
+
+  const gridEl = document.getElementById("grid-keyboard");
+  const dotsEl = document.getElementById("dots");
+  const resultEl = document.getElementById("result");
+  const stepId = document.getElementById("stepId");
+  const stepPassword = document.getElementById("stepPassword");
+
+  let entered = [];
+  let posToDigit = {}; // button index -> digit
+
+  const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+  function renderKeypad() {
+    const digits = shuffle("0123456789".split(""));
+    posToDigit = {};
+    gridEl.innerHTML = "";
+    digits.forEach((d, i) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "cas__btn--key";
+      b.textContent = d;                 // plain text digit, like the live keypad
+      b.addEventListener("click", () => onKey(i));
+      gridEl.appendChild(b);
+      posToDigit[i] = d;
+    });
+    if (window.__stub__) window.__stub__.posToDigit = posToDigit;
+  }
+  function renderDots() {
+    dotsEl.innerHTML = "";
+    for (let i = 0; i < Math.max(LEN, entered.length); i++) {
+      const dot = document.createElement("span");
+      dot.className = "dot" + (i < entered.length ? " filled" : "");
+      dotsEl.appendChild(dot);
+    }
+  }
+  function onKey(i) {
+    const d = posToDigit[i];
+    if (d == null) return;
+    entered.push(d);
+    window.__stub__.entered = entered.join("");
+    renderDots();
+    if (reshuffleOnKey) renderKeypad();
+  }
+  function del() { entered.pop(); window.__stub__.entered = entered.join(""); renderDots(); }
+  function submit() {
+    const got = entered.join("");
+    window.__stub__.submitted = got;
+    const ok = got === EXPECTED;
+    resultEl.className = ok ? "ok" : "bad";
+    resultEl.textContent = ok ? "✓ Reçu: " + got : "✗ Reçu: \"" + got + "\" — attendu \"" + EXPECTED + "\".";
+  }
+  // Reveal the keypad step the way the live page does: a pure class toggle, NO node insertion.
+  function reveal() {
+    stepId.classList.add("hidden");
+    stepPassword.classList.remove("hidden");
+  }
+
+  document.getElementById("erase").addEventListener("click", del);
+  document.getElementById("submit").addEventListener("click", submit);
+  document.getElementById("continuer").addEventListener("click", reveal);
+
+  window.__stub__ = {
+    posToDigit: posToDigit,
+    entered: "",
+    submitted: null,
+    expected: EXPECTED,
+    len: LEN,
+    reset() { entered = []; window.__stub__.entered = ""; window.__stub__.submitted = null; resultEl.textContent = ""; renderDots(); },
+    regenerate() { renderKeypad(); },
+    reveal,
+  };
+
+  renderKeypad();   // rendered up-front, inside the hidden step (so the reveal inserts no nodes)
+  renderDots();
+  if (reshuffleMs > 0) setInterval(renderKeypad, reshuffleMs);
+})();
+</script>
+</body>
+</html>

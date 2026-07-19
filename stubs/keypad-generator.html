@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keypad Generator — pseudo-random keypad fixtures</title>
+<!--
+  Seeded keypad generator for stress-testing the Keypad Recognizer's detector/localizer
+  against many *shapes and colors* of keypad. Everything is derived deterministically from
+  ?seed=, so a given seed always reproduces the same keypad.
+
+  What varies (all from the seed):
+    - layout           rows×cols (2×5, 5×2, 3×4, 4×3, 3×5, 5×3, 1×10, 10×1, 4×4, …)
+    - key shape        circle / rounded / square / pill
+    - key size & gap   40–84 px keys, 8–22 px gaps
+    - theme & color    light or dark, random hue-based palette
+    - element type     <button> / <div role=button> / <a href>   (exercises the candidate net)
+    - digit rendering  "text" (readable digits) or "image" (SVG glyph in a random font;
+                       text/attr readers fail → tests localization-WITHOUT-recognition)
+    - decoys           an optional off-grid cluster of same-count / different-size buttons
+                       to check the detector picks the real 2-D keypad grid
+
+  URL params (all optional):
+    ?seed=<string>        default "1"
+    ?render=text|image|auto   default auto (seed decides; biased to text)
+    ?decoys=0|1           default: seed decides (~40% on)
+    ?expected=1234567890  password the fixture should receive (default "1234567890")
+    ?reshuffle=1500|keypress   reshuffle the layout (ms) or after each press
+
+  Ground truth: window.__gen__ = { seed, style, cellDigits, byDigit, expected, entered,
+  submitted, reset(), regenerate(seed) }.
+-->
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { min-height: 100vh; font-family: Arial, Helvetica, sans-serif;
+         display: flex; flex-direction: column; align-items: center; padding: 20px 14px 60px; }
+  .bar { width: 100%; max-width: 640px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+         margin-bottom: 18px; font-size: 13px; }
+  .bar input[type=text] { flex: 0 0 150px; padding: 6px 8px; border-radius: 6px; border: 1px solid #8893a5; }
+  .bar button { padding: 6px 12px; border-radius: 6px; border: 0; cursor: pointer;
+                background: #2f6bff; color: #fff; font-weight: 600; }
+  .bar .ghost { background: #e6ebf5; color: #223; }
+  .readout { width: 100%; max-width: 640px; font: 12px/1.5 monospace; opacity: .8; margin-bottom: 16px;
+             padding: 8px 10px; border-radius: 8px; border: 1px dashed currentColor; }
+  .card { border-radius: 14px; padding: 26px 26px 30px; width: 560px; max-width: 100%; }
+  h1 { text-align: center; font-size: 22px; margin: 0 0 4px; }
+  .sub { text-align: center; font-size: 13px; margin: 0 0 18px; }
+  .dots { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+  .dot { width: 13px; height: 13px; border-radius: 50%; border: 1.5px solid currentColor; opacity: .5; }
+  .dot.filled { opacity: 1; }
+  .keypad { display: grid; justify-content: center; margin: 0 auto 20px; }
+  .key { display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0;
+         font-weight: 700; user-select: none; text-decoration: none; line-height: 1;
+         border-style: solid; border-width: 1px; }
+  .key img { pointer-events: none; display: block; }
+  .decoys { display: flex; gap: 8px; justify-content: center; margin: 0 auto 18px; flex-wrap: wrap; }
+  .decoy { border-radius: 8px; border: 1px solid currentColor; opacity: .55; display: flex;
+           align-items: center; justify-content: center; cursor: default; }
+  .row { display: flex; gap: 12px; justify-content: center; align-items: center; margin-top: 6px; }
+  .util { border-radius: 8px; border: 1.5px solid currentColor; background: transparent; color: inherit;
+          cursor: pointer; padding: 8px 12px; font-size: 14px; }
+  .connect { border: 0; cursor: pointer; color: #fff; font-weight: bold; font-size: 15px;
+             padding: 12px 22px; border-radius: 24px; }
+  #result { text-align: center; font-family: monospace; font-size: 14px; min-height: 20px; margin-top: 14px; }
+  #result.ok { color: #16a34a; } #result.bad { color: #dc2626; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <label>Seed <input id="seed" type="text"></label>
+    <button id="gen" type="button">Generate</button>
+    <button id="rand" type="button" class="ghost">Random</button>
+    <button id="reshuf" type="button" class="ghost">Reshuffle</button>
+  </div>
+  <div class="readout" id="readout"></div>
+
+  <main class="card" id="card">
+    <h1>Enter your code</h1>
+    <p class="sub">Pseudo-random keypad fixture</p>
+    <div class="dots" id="dots"></div>
+    <div class="decoys" id="decoys"></div>
+    <div class="keypad" id="keypad"></div>
+    <div class="row">
+      <button class="util" id="erase" type="button" aria-label="Delete one digit">⌫</button>
+      <button class="connect" id="connect" type="button">Log in</button>
+    </div>
+    <div id="result"></div>
+  </main>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- seeded PRNG (xmur3 -> mulberry32) ----------
+  function xmur3(str) {
+    let h = 1779033703 ^ str.length;
+    for (let i = 0; i < str.length; i++) { h = Math.imul(h ^ str.charCodeAt(i), 3432918353); h = (h << 13) | (h >>> 19); }
+    return () => { h = Math.imul(h ^ (h >>> 16), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); h ^= h >>> 16; return h >>> 0; };
+  }
+  function mulberry32(a) {
+    return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+
+  // ---------- params ----------
+  const q = new URLSearchParams(location.search);
+  const SEED = q.get("seed") || "1";
+  const RENDER_PARAM = q.get("render") || "auto";
+  const EXPECTED = (q.get("expected") || "1234567890").replace(/\D/g, "") || "1234567890";
+  const LEN = EXPECTED.length;
+  const reshuffleParam = q.get("reshuffle");
+  const decoysParam = q.get("decoys");
+
+  const rng = mulberry32(xmur3(SEED)());
+  const int = (n) => Math.floor(rng() * n);
+  const range = (a, b) => a + rng() * (b - a);
+  const pick = (arr) => arr[int(arr.length)];
+  const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = int(i + 1); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+  // ---------- derive a style from the seed ----------
+  const LAYOUTS = [[2, 5], [5, 2], [3, 4], [4, 3], [3, 5], [5, 3], [1, 10], [10, 1], [4, 4]];
+  const TAGS = ["button", "div", "a"];
+  const SHAPES = ["circle", "rounded", "square", "pill"];
+  const FONTS = ["Georgia", "Courier New", "Impact", "Arial Black", "Times New Roman", "monospace", "Trebuchet MS", "Verdana"];
+
+  const theme = pick(["light", "dark"]);
+  const hue = int(360);
+  const shape = pick(SHAPES);
+  const keySize = Math.round(range(40, 84));
+  const gap = Math.round(range(8, 22));
+  const [rows, cols] = pick(LAYOUTS);
+  const tag = pick(TAGS);
+  const font = q.get("font") || pick(FONTS);       // ?font= overrides (deterministic tests)
+  const render = RENDER_PARAM === "auto" ? pick(["text", "text", "image"]) : RENDER_PARAM;
+  const decoys = decoysParam != null ? decoysParam !== "0" : rng() < 0.4;
+
+  const P = theme === "dark"
+    ? { bg: `hsl(${hue},25%,12%)`, card: `hsl(${hue},22%,17%)`, key: `hsl(${hue},24%,25%)`, keyBorder: `hsl(${hue},24%,38%)`,
+        digit: `hsl(${hue},60%,86%)`, accent: `hsl(${(hue + 40) % 360},70%,55%)`, text: `hsl(${hue},20%,90%)`, sub: `hsl(${hue},15%,62%)` }
+    : { bg: `hsl(${hue},35%,95%)`, card: `#ffffff`, key: `hsl(${hue},45%,99%)`, keyBorder: `hsl(${hue},35%,80%)`,
+        digit: `hsl(${hue},55%,32%)`, accent: `hsl(${(hue + 40) % 360},70%,45%)`, text: `hsl(${hue},28%,20%)`, sub: `hsl(${hue},15%,45%)` };
+
+  const cellCount = rows * cols;
+  const radiusFor = (w, h) => shape === "circle" ? "50%" : shape === "pill" ? `${h / 2}px` : shape === "rounded" ? "22%" : "6px";
+  const keyW = shape === "pill" ? Math.round(keySize * 1.5) : keySize;
+  const keyH = keySize;
+
+  // ---------- apply theme ----------
+  document.body.style.background = P.bg;
+  document.body.style.color = P.text;
+  const card = document.getElementById("card");
+  card.style.background = P.card;
+  card.style.boxShadow = theme === "dark" ? "0 8px 30px rgba(0,0,0,.5)" : "0 6px 24px rgba(0,0,0,.10)";
+  document.querySelector(".sub").style.color = P.sub;
+  const connect = document.getElementById("connect");
+  connect.style.background = P.accent;
+
+  // ---------- SVG glyph (image render mode): digit as vector text in a random font ----------
+  function digitSvg(ch) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">` +
+      `<text x="50" y="55" font-family="${font}" font-size="82" font-weight="700" fill="${P.digit}" ` +
+      `text-anchor="middle" dominant-baseline="middle">${ch}</text></svg>`;
+    return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+  }
+
+  // ---------- state ----------
+  const keypadEl = document.getElementById("keypad");
+  const dotsEl = document.getElementById("dots");
+  const resultEl = document.getElementById("result");
+  let cellDigits = [];  // per-cell content: digit char, or a symbol string for util keys
+  let byDigit = {};     // digit -> cell index
+  let entered = [];
+
+  const FUNCS = ["⌫", "OK", "C", "✓", "←"];
+
+  function buildContents() {
+    const items = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    while (items.length < cellCount) items.push(FUNCS[(items.length - 10) % FUNCS.length]);
+    return shuffle(items.slice(0, cellCount));
+  }
+
+  function makeKey(content, index) {
+    let el;
+    if (tag === "a") { el = document.createElement("a"); el.href = "#"; el.setAttribute("role", "button"); }
+    else if (tag === "div") { el = document.createElement("div"); el.setAttribute("role", "button"); el.tabIndex = 0; }
+    else { el = document.createElement("button"); el.type = "button"; }
+    el.className = "key";
+    el.style.width = keyW + "px";
+    el.style.height = keyH + "px";
+    el.style.borderRadius = radiusFor(keyW, keyH);
+    el.style.background = P.key;
+    el.style.borderColor = P.keyBorder;
+    el.style.color = P.digit;
+    el.style.fontFamily = font;
+
+    const isDigit = /^[0-9]$/.test(content);
+    if (isDigit && render === "image") {
+      const img = document.createElement("img");
+      img.src = digitSvg(content);
+      img.alt = "";                                   // no text/attr leak — glyph-only
+      img.width = Math.round(keySize * 0.62);
+      img.height = Math.round(keySize * 0.62);
+      el.appendChild(img);
+    } else if (isDigit && render === "attr") {
+      // Digit exposed only via an attribute (aria-label), no visible text/glyph — exercises
+      // the reader's attribute path (readDigit step 2).
+      el.setAttribute("aria-label", content);
+    } else if (isDigit && render === "bg") {
+      // Digit painted as a CSS background-image glyph — exercises extractImageSource's
+      // background-image branch (no <img>/<svg>/<canvas> child, no text/attr).
+      el.style.backgroundImage = `url("${digitSvg(content)}")`;
+      el.style.backgroundRepeat = "no-repeat";
+      el.style.backgroundPosition = "center";
+      el.style.backgroundSize = "62%";
+    } else {
+      el.style.fontSize = Math.round(keySize * (isDigit ? 0.46 : 0.34)) + "px";
+      el.textContent = content;
+    }
+    el.addEventListener("click", (e) => { e.preventDefault(); onKey(index); });
+    return el;
+  }
+
+  function renderKeypad() {
+    cellDigits = buildContents();
+    byDigit = {};
+    cellDigits.forEach((c, i) => { if (/^[0-9]$/.test(c)) byDigit[c] = i; });
+    keypadEl.style.gridTemplateColumns = `repeat(${cols}, ${keyW}px)`;
+    keypadEl.style.gap = gap + "px";
+    keypadEl.innerHTML = "";
+    cellDigits.forEach((c, i) => keypadEl.appendChild(makeKey(c, i)));
+  }
+
+  function renderDots() {
+    dotsEl.innerHTML = "";
+    for (let i = 0; i < LEN; i++) {
+      const d = document.createElement("span");
+      d.className = "dot" + (i < entered.length ? " filled" : "");
+      dotsEl.appendChild(d);
+    }
+  }
+
+  function onKey(index) {
+    const c = cellDigits[index];
+    if (!/^[0-9]$/.test(c)) return;                   // util key
+    if (entered.length >= LEN) return;
+    entered.push(c);
+    window.__gen__.entered = entered.join("");
+    renderDots();
+    if (reshuffleParam === "keypress") renderKeypad();
+  }
+
+  function erase() { entered.pop(); window.__gen__.entered = entered.join(""); renderDots(); }
+
+  function submit() {
+    const got = entered.join("");
+    window.__gen__.submitted = got;
+    const ok = got === EXPECTED;
+    resultEl.className = ok ? "ok" : "bad";
+    resultEl.textContent = ok ? "✓ Received " + got + " — matches expected."
+                              : `✗ Received "${got}" — expected "${EXPECTED}".`;
+  }
+
+  // ---------- decoys: a separate cluster the detector must NOT mistake for the keypad ----------
+  function renderDecoys() {
+    const wrap = document.getElementById("decoys");
+    wrap.innerHTML = "";
+    if (!decoys) return;
+    const n = Math.round(range(4, 8));               // < 10, and a single row (not a grid)
+    const dSize = Math.round(keySize * 0.62);         // different size -> its own size-cluster
+    for (let i = 0; i < n; i++) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "decoy";
+      b.style.width = dSize + "px";
+      b.style.height = dSize + "px";
+      b.style.color = P.sub;
+      b.textContent = "★";
+      wrap.appendChild(b);
+    }
+  }
+
+  // ---------- ground truth ----------
+  window.__gen__ = {
+    seed: SEED,
+    style: { theme, hue, shape, keySize, gap, layout: `${rows}x${cols}`, cells: cellCount, tag, render, font, decoys },
+    get cellDigits() { return cellDigits; },
+    get byDigit() { return byDigit; },
+    expected: EXPECTED, len: LEN, entered: "", submitted: null,
+    reset() { entered = []; this.entered = ""; this.submitted = null; resultEl.textContent = ""; renderKeypad(); renderDots(); },
+    regenerate(seed) { const p = new URLSearchParams(location.search); p.set("seed", String(seed)); location.search = p.toString(); },
+  };
+
+  // ---------- controls ----------
+  const readout = document.getElementById("readout");
+  readout.textContent =
+    `seed=${SEED} | ${theme} hue=${hue} | ${shape} | ${keyW}×${keyH}px gap=${gap} | ` +
+    `layout=${rows}×${cols} (${cellCount} keys) | <${tag}> | render=${render} | font=${font} | decoys=${decoys}`;
+
+  const seedInput = document.getElementById("seed");
+  seedInput.value = SEED;
+  const go = (s) => window.__gen__.regenerate(s);
+  document.getElementById("gen").addEventListener("click", () => go(seedInput.value || "1"));
+  seedInput.addEventListener("keydown", (e) => { if (e.key === "Enter") go(seedInput.value || "1"); });
+  document.getElementById("rand").addEventListener("click", () => go(Math.floor(Math.random() * 1e9).toString(36)));
+  document.getElementById("reshuf").addEventListener("click", renderKeypad);
+  document.getElementById("erase").addEventListener("click", erase);
+  connect.addEventListener("click", submit);
+
+  renderDecoys();
+  renderKeypad();
+  renderDots();
+
+  if (reshuffleParam && reshuffleParam !== "keypress") {
+    const ms = parseInt(reshuffleParam, 10);
+    if (ms > 0) setInterval(renderKeypad, ms);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stub — Société Générale clavier virtuel (sprite image)</title>
+<!--
+  Offline test fixture reproducing the Société Générale "clavier virtuel" secret-code
+  screen (https://particuliers.sg.fr/ ... /index-react-authsec.html).
+
+  Fidelity to the real page (what the userscript keys off of):
+    - ONE image (<img id="img_clavier" usemap="#tc_tclavier">) that packs the whole 4x4 grid of
+      keys; 10 cells carry a small, centred digit and 6 are blank.
+    - 16 transparent hover overlays <span class="btn-clavier" role="button" tabindex="0"
+      id="hover_touche_R_C"> absolutely positioned one per cell — these are the real click
+      targets; the digit graphics live only inside the shared image, never in the DOM.
+    - a masked "dots" display, a delete button (#codeSecret-delete) and a "Valider" submit.
+
+  Why the sprite is GENERATED here rather than embedded from the live site: canvas
+  rasterisation of a given PNG is not byte-identical across browser engines/builds, so a
+  fixture built from SG's real PNG only recognises against the baked "sg" glyphs in the exact
+  browser they were captured in. Drawing the sprite at runtime keeps the fixture engine-neutral
+  — it recognises against the userscript's runtime-generated synthetic-font templates in
+  whatever browser runs the test — while still exercising the shared-sprite reader end to end:
+  spriteRegionOf() locating the containing image, fingerprintBitsFromRegion() cropping each
+  key's tight ink bbox out of it (with the cell border excluded), the geometric clustering, and
+  the click replay. The real "sg" reference glyphs are validated live on the bank itself.
+
+  Test affordances (NOT in the real page):
+    - Ground truth is known. window.__stub__ exposes posToDigit (span id -> digit), the entered
+      digits, and the expected code.
+    - On Valider the entered string is stored in window.__stub__.submitted.
+    - URL param:  ?expected=135790  the code the stub should receive (default 135790)
+-->
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Arial, Helvetica, sans-serif; background:#f2f4f7;
+         display:flex; justify-content:center; padding:32px 16px; }
+  .card { background:#fff; width:420px; max-width:100%; border-radius:10px;
+          box-shadow:0 6px 24px rgba(0,0,0,.08); padding:24px 28px 32px; }
+  h1 { color:#e2001a; text-align:center; font-size:22px; margin:4px 0 18px; }
+  .mask { display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:18px; }
+  .cell-dot { width:22px; height:3px; background:#b9c4d4; border-radius:2px; }
+  .cell-dot.filled { width:12px; height:12px; border-radius:50%; background:#333; }
+  .delete { border:0; background:none; color:#333; cursor:pointer; font-size:18px; }
+  /* img_container mirrors SG: the sprite plus absolutely-positioned transparent hover keys. */
+  .img-container { position:relative; width:240px; height:240px; margin:6px auto 22px; }
+  #img_clavier { display:block; width:240px; height:240px; }
+  .btn-clavier { position:absolute; width:60px; height:60px; cursor:pointer;
+                 background:transparent; -webkit-tap-highlight-color:rgba(0,0,0,0); }
+  .valider { display:block; width:70%; margin:6px auto 4px; border:0; cursor:pointer;
+             background:#e2001a; color:#fff; font-weight:bold; font-size:16px;
+             padding:13px; border-radius:24px; }
+  #result { text-align:center; font-family: monospace; font-size:14px; min-height:20px; margin-top:12px; }
+  .ok { color:#087a3f; } .bad { color:#c01515; }
+  .hint { text-align:center; color:#9aa7b8; font-size:11px; margin-top:14px; }
+</style>
+</head>
+<body>
+  <!-- Priming field for password managers (see boursobank-stub for the rationale). -->
+  <label style="position:fixed;top:6px;left:6px;font:10px system-ui;color:#9aa7b8;opacity:.85;z-index:1">identifiant (fixture)
+    <input type="text" name="user_id" autocomplete="username" aria-label="Identifiant client"
+           style="width:120px;height:20px;font:11px system-ui;border:1px solid #cdd5e0;border-radius:4px">
+  </label>
+
+  <main class="card">
+    <h1>SG — Code secret <em style="font-style:normal;color:#9aa7b8;font-size:13px">(STUB)</em></h1>
+
+    <div class="mask">
+      <div id="mask" style="display:flex;gap:12px"></div>
+      <button class="delete" type="button" id="codeSecret-delete" aria-label="Effacer votre code secret">✕</button>
+    </div>
+
+    <div class="img-container" id="img_container">
+      <img id="img_clavier" alt="" usemap="#tc_tclavier">
+      <!-- 16 hover overlays injected by script, exactly one per cell -->
+    </div>
+
+    <button class="valider" type="button" id="valider">Valider</button>
+    <div id="result"></div>
+    <p class="hint">Fixture de test — param: ?expected=135790</p>
+  </main>
+
+<script>
+(() => {
+  "use strict";
+
+  const CELL = 60, GRID = 4, SIZE = CELL * GRID; // 240x240 sprite, 4x4 cells
+
+  // Fixed layout: 10 of 16 cells carry a digit (all ten present), 6 are blank — like SG.
+  const POS_TO_DIGIT = {
+    "1_1": "5", "1_2": "4", "1_4": "7",
+    "2_1": "9", "2_2": "8", "2_3": "1",
+    "3_2": "3", "3_4": "0",
+    "4_1": "6", "4_3": "2",
+  };
+  const CELLS = [];
+  for (let r = 1; r <= GRID; r++) for (let c = 1; c <= GRID; c++)
+    CELLS.push({ id: r + "_" + c, col: c - 1, row: r - 1 });
+
+  // Draw the whole keypad into one canvas: light background, thin dark grid borders, and a
+  // small dark digit centred in each non-blank cell (SG draws its digits small, well inside the
+  // cell). This is the shared sprite the userscript must crop individual keys out of.
+  function buildSprite() {
+    const cv = document.createElement("canvas");
+    cv.width = SIZE; cv.height = SIZE;
+    const ctx = cv.getContext("2d");
+    ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, SIZE, SIZE);
+    ctx.strokeStyle = "#7a8699"; ctx.lineWidth = 1;
+    for (let i = 0; i <= GRID; i++) {
+      ctx.beginPath(); ctx.moveTo(i * CELL + 0.5, 0); ctx.lineTo(i * CELL + 0.5, SIZE); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, i * CELL + 0.5); ctx.lineTo(SIZE, i * CELL + 0.5); ctx.stroke();
+    }
+    ctx.fillStyle = "#1a1a1a";
+    ctx.font = "34px Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const cell of CELLS) {
+      const d = POS_TO_DIGIT[cell.id];
+      if (d == null) continue;
+      ctx.fillText(d, cell.col * CELL + CELL / 2, cell.row * CELL + CELL / 2 + 1);
+    }
+    return cv.toDataURL("image/png");
+  }
+
+  const q = new URLSearchParams(location.search);
+  const EXPECTED = (q.get("expected") || "135790").replace(/\D/g, "");
+
+  const container = document.getElementById("img_container");
+  const img = document.getElementById("img_clavier");
+  const maskEl = document.getElementById("mask");
+  const resultEl = document.getElementById("result");
+
+  let entered = [];
+
+  function renderMask() {
+    maskEl.innerHTML = "";
+    for (let i = 0; i < Math.max(6, EXPECTED.length); i++) {
+      const dot = document.createElement("span");
+      dot.className = "cell-dot" + (i < entered.length ? " filled" : "");
+      maskEl.appendChild(dot);
+    }
+  }
+  function onKey(id) {
+    const d = POS_TO_DIGIT[id];
+    if (d == null) return;          // a blank cell — no digit
+    entered.push(d);
+    window.__stub__.entered = entered.join("");
+    renderMask();
+  }
+  function del() { entered.pop(); window.__stub__.entered = entered.join(""); renderMask(); }
+  function submit() {
+    const got = entered.join("");
+    window.__stub__.submitted = got;
+    const ok = got === EXPECTED;
+    resultEl.className = ok ? "ok" : "bad";
+    resultEl.textContent = ok ? "✓ Reçu: " + got : "✗ Reçu: \"" + got + "\" — attendu \"" + EXPECTED + "\".";
+  }
+
+  // Transparent hover overlays, one per cell (SG's real click targets).
+  for (const cell of CELLS) {
+    const span = document.createElement("span");
+    span.id = "hover_touche_" + cell.id;
+    span.className = "btn-clavier";
+    span.setAttribute("role", "button");
+    span.setAttribute("tabindex", "0");
+    span.setAttribute("aria-label", "Donnée non vocalisable, pour s'authentifier avec un lecteur d'écran, utilisez le clavier sonore");
+    span.style.left = cell.col * CELL + "px";
+    span.style.top = cell.row * CELL + "px";
+    span.addEventListener("click", () => onKey(cell.id));
+    container.appendChild(span);
+  }
+
+  document.getElementById("codeSecret-delete").addEventListener("click", del);
+  document.getElementById("valider").addEventListener("click", submit);
+  renderMask();
+
+  // Publish ground truth only once the sprite has decoded, so the userscript's sprite reader
+  // sees a loaded <img> (naturalWidth > 0) on its first scan.
+  function publish() {
+    window.__stub__ = {
+      posToDigit: POS_TO_DIGIT,
+      entered: "",
+      submitted: null,
+      expected: EXPECTED,
+      reset() { entered = []; window.__stub__.entered = ""; window.__stub__.submitted = null; resultEl.textContent = ""; renderMask(); },
+    };
+  }
+  img.addEventListener("load", publish);
+  img.addEventListener("error", publish);
+  img.src = buildSprite();
+})();
+</script>
+</body>
+</html>

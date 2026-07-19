@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>iframe keypad host — cross-frame test fixture</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 24px; }
+    iframe { width: 460px; height: 460px; border: 1px solid #ccc; }
+  </style>
+</head>
+<body>
+  <h1>Top frame (no keypad here)</h1>
+  <p>The keypad lives in the iframe below — mirrors a bank that serves its login keypad
+     in a (cross-origin, in production) iframe. Here it is same-origin so the test can drive it.</p>
+  <iframe id="kp" title="keypad"></iframe>
+  <script>
+    // Load the seeded keypad generator into the iframe, carrying seed/render through.
+    var p = new URLSearchParams(location.search);
+    var seed = p.get("seed") || "1";
+    var render = p.get("render") || "text";
+    document.getElementById("kp").src =
+      "keypad-generator.html?seed=" + encodeURIComponent(seed) +
+      "&render=" + encodeURIComponent(render) + "&decoys=0";
+    // Ground-truth marker so the test can wait for the host to be ready.
+    window.__host__ = true;
+  </script>
+</body>
+</html>

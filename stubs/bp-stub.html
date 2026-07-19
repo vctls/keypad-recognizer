@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stub — Banque Populaire clavier (opaque PNG glyphs)</title>
+<!--
+  Offline test fixture reproducing the Banque Populaire / BPCE "icgauth" password screen
+  (https://www.icgauth.banquepopulaire.fr/se-connecter/icg/mot-de-passe).
+
+  Fidelity to the real page (what the userscript keys off of):
+    - a 2x5 grid of <button class="keyboard-button"> keys, each 56x56.
+    - each key carries its digit as a CSS *background image* (no <img>/<svg> child, no text):
+      style="background: url('data:image/png;base64,...') center center no-repeat". The glyph is
+      a small OPAQUE PNG (anti-aliased dark digit on a near-white background, ~22x32) — so the
+      reader must use the luminance/opaque ink path, not the alpha path, and normalise to the
+      digit's tight ink bbox (the glyph fills its little PNG with no margin, unlike the centred,
+      wide-margin synthetic-font templates).
+    - digit <-> position shuffle every load.
+    - a masked "dots" display, a delete button, and a submit.
+
+  The glyphs below are the real ones captured from the live keypad (digit -> PNG). PNG canvas
+  decoding is effectively identical across engines for these simple images, so the fixture
+  recognises against the userscript's synthetic-font templates in whatever browser runs the test.
+
+  Test affordances (NOT in the real page):
+    - Ground truth is known. window.__stub__ exposes digitToGlyph, the current position->digit
+      map, the entered digits, and the expected password.
+    - On submit the entered string is stored in window.__stub__.entered / .submitted.
+    - URL params:
+        ?expected=1234567890   the code the stub should receive (default 1234567890)
+        ?len=10                number of digits (default = expected length)
+        ?reshuffle=1500        reshuffle every 1500 ms (default: off)
+        ?reshuffle=keypress    reshuffle after every digit press
+-->
+<style>
+  :root { --bp-blue:#00549f; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Arial, Helvetica, sans-serif; background:#f0f3f7;
+         display:flex; justify-content:center; padding:32px 16px; }
+  .card { background:#fff; width:460px; max-width:100%; border-radius:10px;
+          box-shadow:0 6px 24px rgba(0,0,0,.08); padding:26px 28px 34px; }
+  h1 { color:var(--bp-blue); text-align:center; font-size:22px; margin:6px 0 16px; }
+  .dots { display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom:20px; }
+  .dot { width:14px; height:14px; border-radius:50%; border:1.5px solid #b9c4d4; }
+  .dot.filled { background:var(--bp-blue); border-color:var(--bp-blue); }
+  .erase { border:1.5px solid var(--bp-blue); background:#fff; color:var(--bp-blue);
+           border-radius:8px; width:40px; height:28px; cursor:pointer; font-size:16px; }
+  .keyboard { display:grid; grid-template-columns:repeat(5,1fr); gap:8px;
+              margin:6px auto 22px; width:max-content; }
+  .keyboard-button { width:56px; height:56px; border-radius:8px; border:1px solid #d3dae4;
+                     background-color:#fff; cursor:pointer; padding:0;
+                     background-repeat:no-repeat; background-position:center center;
+                     -webkit-tap-highlight-color:rgba(0,0,0,0); user-select:none; }
+  .keyboard-button:active { background-color:#eef3fa; }
+  .submit { display:block; width:70%; margin:6px auto 4px; border:0; cursor:pointer;
+            background:var(--bp-blue); color:#fff; font-weight:bold; font-size:16px;
+            padding:13px; border-radius:24px; }
+  #result { text-align:center; font-family: monospace; font-size:14px; min-height:20px; margin-top:12px; }
+  .ok { color:#087a3f; } .bad { color:#c01515; }
+  .hint { text-align:center; color:#9aa7b8; font-size:11px; margin-top:14px; }
+</style>
+</head>
+<body>
+  <!-- Priming field for password managers (see boursobank-stub for the rationale). -->
+  <label style="position:fixed;top:6px;left:6px;font:10px system-ui;color:#9aa7b8;opacity:.85;z-index:1">identifiant (fixture)
+    <input type="text" name="user_id" autocomplete="username" aria-label="Identifiant"
+           style="width:120px;height:20px;font:11px system-ui;border:1px solid #cdd5e0;border-radius:4px">
+  </label>
+
+  <main class="card">
+    <h1>Saisie de votre mot de passe <em style="font-style:normal;color:#9aa7b8;font-size:13px">(STUB)</em></h1>
+
+    <div class="dots">
+      <div id="dots" style="display:flex;gap:12px"></div>
+      <button class="erase" type="button" id="erase" aria-label="Effacer">⌫</button>
+    </div>
+
+    <div class="keyboard" id="keyboard" role="group" aria-label="Clavier virtuel"></div>
+
+    <button class="submit" type="button" id="submit">Se connecter</button>
+    <div id="result"></div>
+    <p class="hint">Fixture de test — params: ?expected= &amp; ?len= &amp; ?reshuffle=1500|keypress</p>
+  </main>
+
+<script>
+(() => {
+  "use strict";
+
+  // Real digit glyphs captured from the live Banque Populaire keypad (digit -> opaque PNG).
+  const GLYPH = {
+    "0": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAADKklEQVR42o1VQWviUBCe35SAgoV4U2hBoYUtRKiXCu3FgkIXLNSLvdjLFrbVQPeiYBTUXrY3vbX/wW7BXrYKFlqIYLtg39tJXjK+TVTWKD7zxnkz33zfF+CcccbsD+fumrkLLi7n7d5l7loKZkAxIpx7+Zi3EjviDO8+dxM5P4FTCOcUhl/z+fzu7r7d6ZgNs9/rvb69eVlEKYviwKvN7URkqNXrmqYpqqrYF77UUChcLJ5OLWvRktcOuKVK/R8ff7X/qSpRTTs4PMjl81tbmyJRMpl4mUx8GIEPJMOoOtFK8bQ4taaEUavVVOyC1P1MBnuUMQIZpOnUikQiGPdld/fPx4cPo/J52a5NUXq9vihaHA4ySJ12BzsIh0KDwUMQo/fZbHtnB1Nkj46YN34bThovRqZ0XURwKWLBEcabrSbWgWdMXiZEDaCgx1+PAsV6vbaKSMPh0AlRf1xfE4+AiNRutwXsg4fBGiJtbeJ01Gz2iDBaYFGtGnjARmTDPX0FkQqFApah6ynCCKjc0tkZNoKHyBAEiXReLmOlsVicMAJv8Cyfy2EKHOd6sVUqFew2HA752GnHpPfSiEVmP7NebA3TVBzYX1/fXHYSeZKJJO4hnWWxEYpEpO5NVxBsOHwSxZFGWDq9Z/N3P0NiI5+QiWSaDaEA1K7rFzTzXC6PKVIpXZI/CxrS1VVFsIswAnKkUqmEe5s4EcmRgoZULp/bE4nHCSMgRxK80LSoTKSgIRVOChim6zphBEQkNCinR/XJxYlJgCzElkwkMEU2myWMgIj0MBg4GVSz0fjXYBdMe/797ExUQVuhzCATCZWq2nPNrXLtm5uuGMd4NCaMQCZSs9XC7Y1IBGcedO3Pz7luu4F6cHgoYwQykSzLQpvFXpCpn/O5T2wX3y4cpTuuJWEEPiJ9v7wUrl0qnc1m7zTdn7e3ogU9lcJyZIwgSCTEAg/D4+KxGPLt5KSws70tHgdo5ePxyIcRLCWSUTW0aNSRgipEhSuUMkoriBGsIhKabb/fq9VrVcPodruj0VgWm4wRyI609Mm2VGyyIYHsSEtde6nY5Bj4n8f/+qf/Xykh1/mI7cEsAAAAAElFTkSuQmCCRFNbUERWR0NRRFpJQ09MR09UWldaQkNRSUdHWFVUQkNBSllHWklHS1NSVEdYVlZIVUFLVFhIT05ITlNG",
+    "1": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAAB2UlEQVR42o2VO5aEIBBFa02QaKI7glQTyKb3Mp3aG3Admk/voCeRKaCoaT+l7fGo/Iry8nhAWPCKjxAW+k5fVEWPdOXispSOITdBHsExAnVZv+gRltKD4qYSlClDaSzdcmXIFSXJMjNNnOqAQgaqD6UTFZflMQxN03Z9V/6Uk6BJYTXDaoL4PY5jXVdaKWOsxAgkSFi8f9/rqlJaK62sNRIjOIQ0z1Pfd3Go0m3T4otCHDGCDaR5mtNgFQe3zfAYnPOYiLV2w6iMoBUhSL+vV1XVMXOl+677eT6xzXn/xiLsdQQbSLfbF17TNHHSHrPAECWLvY7gUkj4I5iWMYZHb3QEl0JyziFXa2z4X7OVjkCCxIxWLN5+gbmABIkzxhAqL6qw2UCCxHCcd1EXmIWw2UCCxIwSTmRhpM0GEiRmlFlgiA2jNYsjSMzIOWIhGRKcOxIWUVo6SUsyJDh3JLyTOpMuBEOCc0fCkvdOadLF3pDItQ4hMaOoC532yM6QiMWlayeBZ13sMmW/OHft7BfG2A0j1hFcunbURdqpG0bcCSRIzMg7R36xZsSLABIkrs97JOpCONlAgsSMsi5MUufhyQYSpM9PNpAgXTJiHYEE6ZIR6wg+Of7PT/8/XPeFu98YVl0AAAAASUVORK5CYIJMUEtWRkFTSEhXUEtTWktHVUNLSFtNWVpLTExKUk5aSExJT0lZRERKTFtVU1lOWFZWQlVRSlVWQUVZTkJHSlhTU0lTTUdGUUVQTVNXWlBHREtKVFJGT0xMSFlVSUJSVUJMQkJFQVZLW1NSSlJRWUlHUFBVSFJKT1BHUkZIU0NRSVVFTEhPSVBWRERSVlRSUFJNTEVOWE1VVFhIU0FES1BMS1tORkZbR0hGTlRBVUpPW0VEWlNES0pFWlVOWUpYQkJIWVpHSkpSWk1WWVdWUVNVUkRSS1NaWFdLSk5WUVlHUkFIRFNPV1pHUVFXS1lUVVRJSFJISU9XW1JaQUlXUldZSE9XUkRRQkJHV1dTUE5ZSURSSkpTTlZGSFhYQUlDSUVHTUlSUFVKW0dOTlpNTFFFV0tGTUhBSlNTQVFFSklURldVUEJXTFRTREFSTEtGSkhUQkdZTVlVU0xYWUNRSVhLUVtEWEpWS05DTkhXVEtaQ0JYVFJVQ1BLTElLU05NTENIT01FSk5KSkxMRUhV",
+    "2": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAACd0lEQVR42o2Vv2/aQBTH3990JqmULOluL02z8BfAClLYjIS3ZmFqlnQjzeLAZqR0MRI06WZWWEBqmgUWgzeb67s7n33xr4DR0/18fvd533sGesAfGkplixneo+KhYpS36CFZlYyDmJEbChyJGfGWg3RJaeoWxCSfSJdtt5uXlz+2/fjz4WE2na3XqzAMZRwiAkqlI4j3SZ/e3Gu3W59OTwkhmkY0tNzohvHr6emQekgjBTWkfr9fq9XYVqIZut5oNFut9tXVVxzEIRy87nTyjCBxOZ3OxJvNrrlYLFVGi+Wy2WywWUIcZ5xhBCoky+pNXFclk7SCYK8bOr7g4uKzJB17gjJIGUZoRqMhPw55ff1LkxgYizSJ7yCp28XPm8/5QQkeWdURHC+k1XolsjR2xqqO4HghTWdTFgPRELaqI8jASzzlGd3efkcPZ+dnYRSpkUpdSHY09fWO0c73MRd4jpubbxlGcVI/vGyYb8Iz6u92GUYgG1WX7X4wEEJ3xk6eERQKiSq94XCE8aMDZFHICMqEJHq2bYvL1jW7hYwUXeSEhK3B4F7cLtPsVhQkKBPS3Y87ISSrZ1UXJCgU0qNtM3wa6fWsMkaJjiAvpIk7Oamd4P6uaZYxUnUEGUj/3t5Qf4gA6w2qsJBRRkfZO9K57uARDEP3d35F1VZ1BCokz5tzCRDXnVRXbVVHoC5DeJiFL5eXFZctryNQIdXrdUEx2Ad7/AdY7vaswQwbi7tBEEWh+h2JIYVhxGs/K9+akJQwvKeJRxOj2u/n54QRJJA2my1fk2wocCS/KoS5kIygDFKZkPKMoLpqH1OQoLpqH1OQ4JjPf3VB+g+f1SsLIVC9XwAAAABJRU5ErkJggkdWV0tVQ0dOVlVUUEVRSlJTS1pMW0taWUZCVktPRVdOWlFNVFZBTU9RTlZUSUhVW1ZGQklTR0VPTUJQRFhNWlRES0hHREJaTUZKSFBZVUtSQklSRE9JSFBaRkJVTUtSR0dITFNOREpTUUNFR0JZV1FVWFRLR1pOUVBbQ0ZOWkxFWUtEQVlPSktZT1ZRR1hWRVRaTU9KSURFSkVKTVJIV0RUQ0xaWEdFWFRBSE1VT1pVQk9BQkVWQk9DTU9BQ1dCWFdDQ0pCQklDSU1PTVNVSkpES1JIR1NTRk9VQ1RSQVdVU09aQ0dPUlBWUVBKTU5W",
+    "3": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAACwUlEQVR42pWVz2viQBTH39+UgRQUIihU6EK8WXChbi/xmkJ7cS/d2/a2vWn3Yi9SLyYFa6G9dEGhVYiXbfemF71E6IKCPyHZ5yQZp1N1bVAzmTzfvPm873sDruvQy6UD1xs6rj9i83TCn6c3+qE2wJ7c4JXjv3Id38oNPLhOYOFNeE/AB8HM2p3ObbVaLBYNw2g2Gv2+7du4gf9lGC4sF3Gc0XhcKFwmVFWSiIQXIfSOvySVSrValsMHRQd+FG6wZ03TFv8jJBwKHR5+0XVd0zLx+C7zePHz4j0j4CFVbm5243HTNCeTKc+oVq8lEir6kWX59/OzwAgESOPRiNvZklGn01YiCgaS0bQAi+8J1kHiGXkLfDs9xc0oisKzWLhguhAg8Yw8g1KpRChi27Z5HcH2QsIce0kaDoa8jmB7IR2fHKODWDQq6Aj4YHlIAqNetxdRFIwil8sLjCDYgiNA4hm1O+29vU+LdGQ0TJnACN6szEGq1evV2+ploYDqwsXD4dDVVWklIwgCEotN3pF9jdMvxj+ZTlcygpVCwlv2a1bLZLBeUJELzUtSJKJUKpX3OoJ1QmKMBsNh2SinUp9pNNL5+Q9BR7BOSAKj+Xym60fe1h6fHnkdweaOxDOazWf7+0kstmQyyUcKmzuSwAh3IVG+w8GA6QhWCmldsT08/PI6h2VZb1gIQtpQbJbV8rJTr9dYePChrl02DIlG0bf7jBF8qGsf6TqyiMWiPCNgZv8ttvu7exIolWcEbGXb7mez2UazickTiu319e/3szMqeXKQTqNGeEbA1ro2TSo/KRQKp9MHKCT0iBpXE+qOLNMmTnC+2+0JjIBl8OXlz8nxSTgUJvTkkLygiYePqGri/u5uJSMQhDSbzbDNG+Uylnk+nzOvTavV6i+a5VpGsLlrb9OQYHPXXteQeB3BNsf/5tP/H7hFJXxuAkFHAAAAAElFTkSuQmCCTkJKW0RVVUFDVk1XT1ZDUUVWTUVaVFZMSlNJRldTS1hIQllSU1NRQUpZWVBCTEdCRVpKWklQVllNTU1HSEdJVVtOREJCSlBESVJNW1BWREpUVEJSQktTQUdUWEdVSVJRSU5ISU9JU0ZQVUxPTEdFVFpEW1JaSE1HT0xLQU9DSEFTWE1YRU5IT1NHS0ZGTlNaTExPREtaWUJLSE9WUU1HV0RaW1VD",
+    "4": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAACiElEQVR42pWVPW/bMBCG7zdRgASoQANYgLQ6a7rae9NI/8ABGqCx1+YPNAC1eLQXe2tWKwWatQFswF6adJMWKsdPM5SUqLJsH/VxfPnovRPUjNXiw2rxy2O+q+Miqs1xOTyOeATmDj5kKlGto1oelVertFYiEYDJqU+aq5UKcyu/Rs9UWxOAPMFMUmsJ9nJub3+cfMTtZD6fK2lKBIPaCD1OYSUSIlbrFSEe8fieU+owgi5IRuqv+/swDP0g8APfI4TS3GEEXZBkoj+Pj9EgwjvznMZJjCqoVmEYQRck/K+qcjg8JYRMZzM8msQxrgRVOI/csGAOJNwnk0tE8OXiQs4QJ4lnWFg+gi4jrdZrvD9J4n/Pz1IeXwjBFLnjI2g10v6wH0QR3vDz7s4wimNUQWhOHR9Bq5HGozGSu77+ZjNKuApMkTs+gqaRFoslznY6HJZlZTPiLPDRUOr4CBwjlVUl18yX8JqRUOGhCsdH4BhpNp2i2s/n501GwhdEprB9BI6RAm5Df7fbNhkpXwgWNiOoj3XB0jRDCV+vrlqLTT4RzeLICIyI7XaHS0UR+ERbiy02LFx3aizoRZzkcjJpLTbhC1EjOXUYSV+wv09Pvh/gFaPROMvSLMUtw0BEmQizD2GIc5x9Okv5iXS5WEpGyhe/Hx54NyB8U41BDWTg6ZiPxIXe95sbXalCT1WWm02xwS//EVvBQzES/0UxiAayagtx6rA/SBrQv2sjTlMjNiPo37XRnapradgyCfTv2gn6Aoudq2B204Y3urbpg1Ief6iyUhmzmzZ0de0mI+VO3S+sGukwUpOR7hfUYQTNrv2/bzZwunafN5vDCJyu/e6brckI+rz+32b0Aow5FfRjmDi0AAAAAElFTkSuQmCCTlpIUFdYVFJYWklCS1NOVU1aRFJMQktPREhKVENGUFhBRllRR0RZVEdQU0NVWE9YT1hISFFaVVBTRkhHQ01NSldOSFdWSEhSSlpDTVlGTEJVQklNSVRSQkxRTUNZTE5FW1BNSkVPWExVS0dEUFVIUlVYSU1GV1VYVFtURkNRSExVRklDU1pOU01CTlpKTFRbUUNaQ1lJV1BLVlVXT0RQUlNOWlJQRFtNQUpaUlZPQUhPWk5aQlZHRVRETldOU09WWlNRT1NJW1JFU1tETElEWlpFTVpKV1VRR0hQVENB",
+    "5": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAACg0lEQVR42pWVPW/qMBSGz28KX1IjXRaypCtssJE/ABusdKUSXWCFDSTYQLpdYAEJBrawlA0kblmoBFKQIO6xnRhfu0GUj9gmxyeHJ+95A8T3ic8PBAefDnTCF+wMCed0Qm6/BjHAJsFmERTmCjeQYBePCfKz03gAX1xBnAxSBnn8W0VhOUFIcGEIN4ggUi6X0n/wlU7zAd/sEK7SzVbLJ76oCIiclC2KjmMYRox++CGGg0EHOsFvo9GQGYEOqVDI445Bf7D/3O8/8UVHnO3pjC5Pp6PMCHRI2VwWLzVfzB9kBDokK5PBet2VqzASxRK5BuLrLMiTaWKK7WajMBI1KDoCRUje+czpHU+nH4Wk6wgUIe12//AmJFPJKCHpOgIFkuu6WIVt21FC0nUECqTJeIIg8oW8zuhW0f+MQIHU7fW4kEzTzGWzqNR6vT4cDS/Xa1SzgQKp2WwlU6lYIEwuSjqx7edur3u5XnRGEAXp8HVYrdzhcFSr1TKWxZJRRqhUhRFEQZIZeZ7XaXfi8QTW4xSLl8tVZgRRkHQhddpt3mxvjYZsSHDfkRQhIV3kgh0gGxLcdySFUa/XZd1vHA5folK470gKo+VyyW/QdDoTERDEPSYk1K7BWmgyHgtG8CvXfn//y5twu9nK3vkL165Uq/g3TPNJZgSPu/ZsOmMo0TvfZEYgC6lSqWKpx+NROBJPid5Rf31FB0BdZHM5zzvLjG7PEdrmzLCTyRTGlUslzOg4zrNtJxJx1i5GvlBYrz8URiBu+m63e6m9WBmLdxfT4a3ZLCsz6Pd/ZAS6kD7W69FwhHJutZrYnYvFHK3sDiO470hRrq2zII83m64jeOTxf//p/w1kWyo46ZYABwAAAABJRU5ErkJggkJaWFFVVEJWUUhGRVVWSlpCSE5SRE5JRE1ORFhGUU1EQlFZQk1GS05VS0VTRlNPUVVYUlRSUFNMRFdRRURBREhRQU1WWVhFVUtYVE9GQ0tBW0ZMVEhTVktPQltIV1hLQ1lZUE9JW01LRVlSVlhZRFRLSkRMVEpOWU1ORkVLREhNUElBRkFLT0VJR05JTk1BUUJaWERbTVNOTlpRUFZDTU9CWVNNVUhIRVhXTVVBVUlLRVlVVUpGRlhJUkNHTVFTRVJGRlNMRUNZV0hPQU9YVU5aSFVNSUZTSEdBQktBRUdZUkxQ",
+    "6": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAAC/ElEQVR42o2VwWviQBTG3980QgIRFFqINwULCluwtwpd6F7UWuheFPRu76Z2PSlU6EKFLujFhS5sL1qhXvTSrWC29pJCCzGzL5nNdDbRsEIm47yZzHu/fPMFKLXsH96o3cUb/8MjbMRiob+jbJLdBd6nfDmfwpdblhtyx91Z2AW+F6X0n2nuzpQ/wx03zZW4Mbg58XIscQGLTKez8/Mvnw4PU6l0JBo9Pa1RIWdwS3Bzs4R0LKvX76fS6RAhIWI32OJVrVRERrAJ0vxxvpfZY4slWSoeHzebzZubHwtd9zCCtZDuxmM1phJCJFkul8u/Hh4CGAEPuKMUF0QjUdx+a3t7OpsGMGKrwA1QFliZq4yTf1hRRsPRJkaijsAjpHa7xbBdX39by8ivI/AIKbmzgwgOPh5sEpJfRyBCQuD2ayOk1Wr7GXH5e3QEIiTUDK7HQhYL3cOIvivcqyMQIe1ns5jEXibz9PsJ5ZjP5Xd3P0QjkWQyeXRUqNe12XTm1xGIkPAthOx3uYVyIE46Tln2xRolrFx0Oh5GwCEZhmHL11YwicXU2mmt270aDkf6Qse2c9FJxONM6FivyAg4pMf5nDgk6ppmrky/kF5f33K5PE6RJBknc0bAIU3uJ04WZDAYbBISZqQoYcykXC7xCHDN399PnHpJr98LEFKhUMBy4okEP2zANWMYLwxep3MRICRkhLOwFjwKFmfBa8Yk8RGNs0aAkNqtFoOq6wsWAevdMCmq23aUaiVASJqmYaqyLJmmyaoE0bVRPxhWVTXAtXED5JWIJwTvFLj/vL1lGhqORmtdG3e2rSgUOvl8whmBx7XR7PAp2L4YhujaLKl2q21XIcloyJwReByp3++FHKvd388ul8/iYUMrwcW4QblUEhmB35Guul0lHGbGi65frVTz+VxMVdlBKRaP317fREaw1pHGd+N4Is6OFj9seGTPGg0/IwhwpOfn5eD7QNPql5df2TH3f9mY/QY50ibXFhlBsCNtcm3RtOF/Pv/BX/8/mKTxe74qkzEAAAAASUVORK5CYIJXU1pFR0NOWVdSREtMWFFQQ09SVkZaTElOSFhSU0hFTFpHU1BRWU5QU0FLRVlCUldERURXSVFQT0dWU1pXUllKTENXRllMRUdVSEdLU1haUkVbR0pYV0tOVlhZWEZKQklDR1FHRFdCTVJI",
+    "7": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAACGUlEQVR42o2VvW7CMBSF7zMlVIIFJCqFhbxFspStSGUjUronC2ywlReAlUp0g7IWCZay0KXQFTan1z9xArEdAtjXxk7sz+eeQELwwiJJaIQFjUlWJbyL8JgOEP0spP0gWqIp/uJzsgmiSMQIIu9LWyAfmZCritfZI/n49NlJ7gGQNsloNK43GnX2w5J+aIvG9GJhI+1/DUOSbh7kTQfDoUUv27Jtm1Ys5g0sWWylVT8I5NJAru74e/zabOiXXjzapC3R/lgsqtUa3mI2nUpGoIOkZOT5Pq4i6PfzjEAHiWQYRd94NMJNOC3ncjnzfnbijEVyhT1VyNU9yeHwU63hFqz3+fxGR3CnkJ67XaTqeX5RR3CPkHa7LTsga73+LDKCe4TUe+nhKfiep2QE+Zl5SJLRfv/9UKmwJayLjKQuiCHZgn6AyvJ9T5dsQDIQimTDg6hRLVmr5UqXbGAQElZxFOF8x2kZkg10QuJj2m4b0yOKoyIjqSNQConHmB882TBJDIYEBkeKohjP0m27ZkMCgyO5bhsTezgYmg0JdJDYLqg5bHe7IqO8jkAHKY5jxNBynCKjGx2BDhLKGZfw1OkoXTuvI9BBajYfLXqccakhgRLS6e/E3XI6nZUaEighLZcrm/kuQi01JFBCmkzeuGufz5dSQwIlpDAMcRuoi3sMCUpdu9SQwOzapYYkc4QYks1sSIJF6evf/Pb/B9R+YZWfRgY+AAAAAElFTkSuQmCCTkRMRlpGV09SQ1VOREdKQUxLWk9aVENKWVFLQVFCTk5ZUVNFSVNDVlFLV0lTTVVHQkxDS01IS0NYRk1NWlNKT0xRU1lNVE9OTFBFVkpPUENGRFNNTU1bRE9LRk1FWVlIWEVOSEhQQ1JEUldUTUtJTVdYW1JZW0ZEWEROR1FERFZJRkhNSFhDRFZLQkxRVVtCT0RER1lVRUpXVElZQltTWVhJSk9WV0ZWVUxDUUFVU1NWQU9DR1lTU1tSWURaR1lYUk1NU1FCRFFEWlhKQ1FWTFZNUEtVQ0pKQVJURlFLWkVFSlFBUkhCRlJHWUxHUkNIR0xDSFNbUVpUWlZSVFpDUE5SV0lCQVVKV1NXUkJTRE9MUFFFT0pTV0tLSVJWVklaUVdOS01MVElHRlpXUktKUFVZT1JOWEJZQUtOQlNYSE5UQ0xRUlJPVUFMT1FI",
+    "8": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAADZklEQVR42o2VQWviQBTH5zNNQEEvejHgwi60oNCCQrzESxfai166F3tRsObWgoK5tPauUG96S2y3e7EKLbg9tqDdi1pItpl9mUnGadSy0saYeXnz3u/93xtEHPiwC6Ff9IaIP9xlz4IbEfbDvUXkwwL75ZuwN7kPQvznxHtOr4j4PleL9G65fLsfDtvtTuuqdXMz+PP6+sGtsDHy3PupwPdiMa+Uy6FQSJIwxpL7J7mfdCo1vL/n9sS/QwEWjw+PiYRM38OpVLpQKJROTnKKEolEmKPz87MAIyRCsmwrnU7B5slk0jRMkdF0Njv4fsAiGgwGIiMkQmrU62ABKYzG43VGsMHu7g542d3ZcVgmhEUhQMqredilWCx4yX1kBP+ddtvFI+HpdOZt4FXEC4nE4jFw0WzqfslXjJjF48ODixhLhmHwLBEXkmVZoVAYdrhqtbYJaTKZuDCwZJoGN0GikLKZDBhUT6vbhNTr91kUQJevrVjApVo9BeSynFjM5xuFBDUGg739fZER8pG5Vnd3v1jZisXi23LJGTH8hmGGIVOM4UZkhPyIvQ2buk5DxV+/fev3+7ZtMf+dTjsMesW4VtMCjBAhTkDzkHBCljFVdyweL5VKp9UqhYhrWm2dERLa3BPS78kkmwWuOBwOURHQTpFwPq/S7IKMEA+J5QwFj0aj8BoIbDadPj096XoTmoUxkmW5e30dYOT3CHUzHA4j9H2tpgUYGaa5v7dHA5K63a44kJA4kXI5BWzUvLryKjCaLxaZbBaiAQU+v7zwgYT4RHIr6iYumVS864zgfjab0oRYXdgS1wVxLi8v6JTAtmWLZQs0GzQrGGUyGR8q8XvEccqVCniAcooTab3Zjo9/gIsvySR/jjgXHUTl5hmyIIrtU/vo6BAihbEgzk7il9NkIhiPRtum9t/3dxhoYKbVapwR4mYwdWOxOPhQlJyz8TBwiN7UmdRuf95yRohPJLj2ej02tQ8Pj6Bs3nlE1yzbrjfq0GawWilXREaITyQW+NnZOdNPNBJRVRXGt6ZpkH8ikXCfgsxV1bYsJ3COBIQ0Ho8URaF9JbFmY4ygCtfd7jojJB5topBenp9hul1cXjQa9V6vD70HldrIKHCmbpjafCCxZa4j3mzocyEFmm3j6Y/+5/j//PT/B8f1vIneIt62AAAAAElFTkSuQmCC",
+    "9": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAgCAIAAACZ9R/cAAADEklEQVR42o1Vz2viQBSevynRCC0o6KV2by3ozYKChQoKerPQQgsWUqh3a+2lrTeFCOtNYbu9uhZ6UAtbiNC9tLCFLSQKM/vMSyaz0WYbJZnMvLwf3/vee4RRyvAHK7ysFVvsUeoeMIb71JG2Nyix36h96rwwe+kqQtV4zLhhWBLqmGKCGDxMwxgMBjfNZq/f+/X8zF2zjik3DHdir919Op3qmXRaUUKyLMmSdclyNBa9bDRsOTSDPluBUNHC3fe7cDgCX4YUJZlIHhweZDKgTkFF5XLZNA0PRkQEafL4GAgGwXgqlXp9eeUYGYZ5fX0lL1ySi6WSByMiglTI58H3RDJhmOYyRvWLOjgCeiaTCYaMzhMewsPDA3wP/46m8bSJGMEtmUiAI4eHB4ynn1lYoGCzeQPoBQKB+Xzu4M7+ZQk7r9UsmEIvry+cR4SLnFQqYGEjHvch0mg0Qk9/DAacR4QTqVQswSG46kOkP+/vmOSv3S7HiDi6qKqqYCAcCXtC8BBJCYVArHHZ4BgRnp5F2iwTv9/ebD9WESkWjYKKSqXCMSJcZjwaS1agtVrNp9ji8TiYOT464hgR5ooAHEWIc21tfTwerSw2faqvra+DzFm1SoUaodzCz6enSCS8SFtIUU/Vb7e3U10HIvX6/avrKygcCRkqS/X6BTdMxLTBU9enqZ0djEjGwhCKbSO+AWvYaLVaHCO3Rnjws9m8o3VU9XQ3mwXwtre284V8tXoG9NU0DR1ZROoAQPw7kqch7e+XQQOAJWJE/DuSp9hiMciotJfLeWvEh0hisQ3v7xGjfq9H3TRhjXxMJK57Pp+l0xnQsLn5hbkhI8E/17VPKidWkuRu96sHI/KZrt1qty02ACmPlzEiYtcWQUKvhsNhLrcnWcwo5AumYS5jRHhHQssQM7R8aP9ap5PdzSKR4HvgxUqMEAt3gFzU69CREHbJYWSxWBSJtMwjIhLpvHYeDASBkVtb2+Xyfrvdgpny38lGRCLNZrOVk20ZI5FH5CMieTDiRFrmEfkIJBEj/+lPPjP+/af/XzBo8DI7IGbNAAAAAElFTkSuQmCCRVNJSVpUT0lTUkJCQ1BKRkFKWEVJVkhGRFBMU1RQVEJbQklRQkVKWVZHUUxVSkZDQ0JISVZCVlFLQVJLQVZQR1tSSFpUQktXWlVNVUdOWUtMT1dZ"
+  };
+
+  const q = new URLSearchParams(location.search);
+  const EXPECTED = (q.get("expected") || "1234567890").replace(/\D/g, "");
+  const LEN = Math.max(1, parseInt(q.get("len") || EXPECTED.length, 10));
+  const reshuffleRaw = q.get("reshuffle");
+  const reshuffleMs = reshuffleRaw && reshuffleRaw !== "keypress" ? parseInt(reshuffleRaw, 10) : 0;
+  const reshuffleOnKey = reshuffleRaw === "keypress";
+
+  const kbEl = document.getElementById("keyboard");
+  const dotsEl = document.getElementById("dots");
+  const resultEl = document.getElementById("result");
+
+  let entered = [];
+  let posToDigit = {}; // button index -> digit
+
+  const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+  function renderKeypad() {
+    const digits = shuffle("0123456789".split(""));
+    posToDigit = {};
+    kbEl.innerHTML = "";
+    digits.forEach((d, i) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "keyboard-button";
+      b.style.background = "url('" + GLYPH[d] + "') center center no-repeat";
+      b.innerHTML = "&nbsp;";
+      b.addEventListener("click", () => onKey(i));
+      kbEl.appendChild(b);
+      posToDigit[i] = d;
+    });
+    if (window.__stub__) window.__stub__.posToDigit = posToDigit;
+  }
+
+  function renderDots() {
+    dotsEl.innerHTML = "";
+    for (let i = 0; i < Math.max(LEN, entered.length); i++) {
+      const dot = document.createElement("span");
+      dot.className = "dot" + (i < entered.length ? " filled" : "");
+      dotsEl.appendChild(dot);
+    }
+  }
+  function onKey(i) {
+    const d = posToDigit[i];
+    if (d == null) return;
+    entered.push(d);
+    window.__stub__.entered = entered.join("");
+    renderDots();
+    if (reshuffleOnKey) renderKeypad();
+  }
+  function del() { entered.pop(); window.__stub__.entered = entered.join(""); renderDots(); }
+  function submit() {
+    const got = entered.join("");
+    window.__stub__.submitted = got;
+    const ok = got === EXPECTED;
+    resultEl.className = ok ? "ok" : "bad";
+    resultEl.textContent = ok ? "✓ Reçu: " + got : "✗ Reçu: \"" + got + "\" — attendu \"" + EXPECTED + "\".";
+  }
+
+  document.getElementById("erase").addEventListener("click", del);
+  document.getElementById("submit").addEventListener("click", submit);
+
+  window.__stub__ = {
+    digitToGlyph: GLYPH,
+    posToDigit: posToDigit,
+    entered: "",
+    submitted: null,
+    expected: EXPECTED,
+    len: LEN,
+    reset() { entered = []; window.__stub__.entered = ""; window.__stub__.submitted = null; resultEl.textContent = ""; renderDots(); },
+    regenerate() { renderKeypad(); },
+  };
+
+  renderKeypad();
+  renderDots();
+  if (reshuffleMs > 0) setInterval(renderKeypad, reshuffleMs);
+})();
+</script>
+</body>
+</html>
