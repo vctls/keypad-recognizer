@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Keypad Recognizer — shuffled PIN keypad bridge
 // @namespace    https://github.com/vctls/keypad_recog
-// @version      0.6.0
+// @version      0.6.1
 // @description  Detects shuffled numeric login keypads and lets a password manager fill a real input that is then "typed" on the virtual keypad by simulating clicks.
 // @author       vctls
 // @match        *://*/*
@@ -1266,6 +1266,51 @@
   // ------------------------------------------------------------------ click replay
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
+  const now = () => (window.performance && performance.now ? performance.now() : Date.now());
+
+  // A generic "did that click register?" probe — no per-site knowledge, so no keypad ever
+  // needs a hardcoded delay. An ACCEPTED keypress always makes the page do something we can
+  // see; a DROPPED one (a debounced handler ignoring a too-fast tap) does nothing. We watch
+  // two site-agnostic signals, in order of trust:
+  //   1. ENTRY PROGRESS (authoritative) — keypads pipe accepted digits into a field, growing
+  //      its value by one. We track the SUM OF POSITIVE LENGTH DELTAS across page inputs since
+  //      the probe was created. Deltas (not absolute lengths) are essential: a pre-filled,
+  //      often numeric username (SG's "Identifiant client") would otherwise dominate a max()
+  //      and mask every increment. This counts only the field that is actually GROWING, and is
+  //      format-independent (digits, bullets, anything). input.value writes are invisible to
+  //      MutationObserver, so we read values directly.
+  //   2. DOM churn (fallback) — a filled mask dot, a reshuffle, an aria-live update, over the
+  //      whole document minus our own panel. Used ONLY until entry progress proves itself: a
+  //      DROPPED tap can still fire churn (hover/active/focus class toggles), so once a real
+  //      field is found, the caller locks onto (1) and ignores churn — otherwise a debounced
+  //      keypad (SG) would read every dropped tap as accepted.
+  // A site that exposes NEITHER is "unobservable"; the caller falls back to a blind fixed
+  // cadence so we never regress correctness.
+  function makeRegistrationProbe() {
+    let mutations = 0;
+    const obs = new MutationObserver((records) => {
+      for (const rec of records) if (!inOurUI(rec.target)) { mutations++; return; }
+    });
+    obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+    const len = (inp) => (inp.value || "").replace(/\s/g, "").length;
+    // Baseline length per input at probe creation (i.e. before any code digit is typed).
+    const base = new Map();
+    for (const inp of document.querySelectorAll("input")) if (!inOurUI(inp)) base.set(inp, len(inp));
+    const entryProgress = () => {
+      let sum = 0;
+      for (const inp of document.querySelectorAll("input")) {
+        if (inOurUI(inp)) continue;
+        const grew = len(inp) - (base.has(inp) ? base.get(inp) : 0);
+        if (grew > 0) sum += grew;
+      }
+      return sum;
+    };
+    return {
+      mutations: () => mutations,
+      entryProgress,
+      disconnect: () => obs.disconnect(),
+    };
+  }
 
   function dispatchRealClick(el) {
     const r = el.getBoundingClientRect();
@@ -1286,32 +1331,121 @@
     el.dispatchEvent(new MouseEvent("click", base));
   }
 
-  // Type a secret by clicking mapped keys. Re-scans before EVERY digit (handles reshuffles).
+  // Type a secret by clicking mapped keys.
+  //
+  // SCAN ONCE. Real keypads do not reshuffle on every keypress (that would be a hostile UX),
+  // so re-recognising the whole grid before each digit was pure waste — the dominant per-digit
+  // cost on a real page, where reading ~16 glyphs off the live DOM is far from free. We map the
+  // keypad a single time and reuse it, re-scanning only if a mapped key has actually left the
+  // DOM (an SPA re-render or a rare timed reshuffle replaces its nodes → `isConnected` is false).
+  //
+  // Pacing is ADAPTIVE, not a fixed throttle: we type at full speed and confirm each click
+  // actually registered (see makeRegistrationProbe). A well-behaved keypad accepts every tap
+  // instantly — confirmation resolves on the next microtask, so `gap` stays 0 and there is no
+  // artificial delay at all. Only when we catch a click being DROPPED — a debounced handler
+  // (Société Générale) ignoring a too-fast tap — do we re-click that same key with a growing
+  // gap, carried forward for the rest of the code. Discovery cost is paid ~once per run.
   async function typeSecret(secret, onStatus) {
     const status = onStatus || (() => {});
     const digits = String(secret).replace(/\D/g, "");
     if (!digits) { status("Nothing to type (no digits).", "bad"); return false; }
-    for (let i = 0; i < digits.length; i++) {
-      const kp = await findKeypad();
-      const byDigit = kp ? kp.byDigit : {};
-      const el = byDigit[digits[i]];
+
+    const GAP_STEP = 120, GAP_MAX = 600;  // learned inter-key gap escalation (ms)
+    const CONFIRM_MS = 250;               // how long to watch for a click to take effect
+    const RETRY_MAX = 5;                  // per-digit re-clicks before giving up
+    const probe = makeRegistrationProbe();
+    let gap = 0;              // inter-key gap learned for THIS site during THIS run
+    let observable = false;   // have we ever seen a click register via the probe?
+    let entryMode = false;    // a real field has proven itself → trust ONLY entry progress
+    let blind = false;        // site exposes no signal → assume taps land, use fixed cadence
+    let kp = null;            // cached keypad mapping (scan once, reuse)
+
+    // Return the click element for `digit`, (re)scanning only when we lack a live mapping for
+    // it — i.e. first call, or the previously mapped key is gone (reshuffle/SPA re-render).
+    const keyFor = async (digit, i) => {
+      if (!kp || !kp.byDigit[digit] || !kp.byDigit[digit].isConnected) kp = await findKeypad();
+      const el = kp && kp.byDigit[digit];
       if (!el) {
+        const byDigit = (kp && kp.byDigit) || {};
         const have = DIGITS.filter((d) => byDigit[d]);
         const missing = DIGITS.filter((d) => !byDigit[d]);
-        status(`Stuck at ${i}/${digits.length}: no key for "${digits[i]}". Recognized ${have.length}/10 (missing ${missing.join("")}).`, "bad");
-        return false;
+        status(`Stuck at ${i}/${digits.length}: no key for "${digit}". Recognized ${have.length}/10 (missing ${missing.join("")}).`, "bad");
       }
-      dispatchRealClick(el);
-      status(`Typing… ${i + 1}/${digits.length}`, "");
-      // Pace between keys. Some keypads debounce/animate each keypress and silently DROP
-      // clicks that land too soon after the previous one — Société Générale ignores taps
-      // spaced ~90ms apart (only ~half register) but accepts ~250ms+. Use a generous,
-      // human-like gap that clears that window on every site (verified live on SG); it costs
-      // only ~2s for a 6-digit code and reads less robotic to anti-automation heuristics.
-      await sleep(jitter(260, 160));
+      return el;
+    };
+
+    // Watch for the just-dispatched click to take effect. Entry progress (a real field growing)
+    // is authoritative; DOM churn is a fallback used ONLY until a field proves itself, because a
+    // dropped tap can still fire churn (see entryMode). MutationObserver callbacks and input
+    // handlers both flush on the microtask queue, so an accepted tap is usually confirmed with
+    // ZERO wall-clock delay; we only spin up to CONFIRM_MS when nothing happens (a dropped tap).
+    // Returns "entry" | "churn" | null.
+    const awaitRegistered = async (baseProgress, baseMut) => {
+      const deadline = now() + CONFIRM_MS;
+      for (;;) {
+        await Promise.resolve();
+        if (probe.entryProgress() > baseProgress) return "entry";
+        if (!entryMode && probe.mutations() > baseMut) return "churn";
+        if (now() >= deadline) return null;
+        await sleep(4);
+      }
+    };
+
+    try {
+      for (let i = 0; i < digits.length; i++) {
+        const el = await keyFor(digits[i], i);
+        if (!el) return false;
+
+        if (blind) {
+          dispatchRealClick(el);
+          status(`Typing… ${i + 1}/${digits.length}`, "");
+          if (i < digits.length - 1) await sleep(jitter(260, 160));
+          continue;
+        }
+
+        const digitBase = probe.entryProgress();  // field progress before this digit's first tap
+        let registered = false;
+        // We only ever RE-click a key once the site has proven itself observable. On a site
+        // that accepts clicks yet exposes no signal, a retry would land twice and duplicate the
+        // digit; once a click has been confirmed, "no signal" provably means "dropped".
+        for (let attempt = 0; attempt <= RETRY_MAX && !registered; attempt++) {
+          if (attempt > 0) {
+            if (!observable) break;                 // unverifiable — don't risk a duplicate tap
+            // Previous tap was dropped: grow the learned gap and space this retry out.
+            gap = Math.min(GAP_MAX, (gap || GAP_STEP) + GAP_STEP);
+            await sleep(gap);
+            // A slow-but-accepted tap may have landed during the spin+back-off; if the field
+            // already advanced past this digit's baseline, don't re-click (that would duplicate).
+            if (probe.entryProgress() > digitBase) { registered = true; entryMode = true; observable = true; break; }
+          }
+          const baseProgress = probe.entryProgress(), baseMut = probe.mutations();
+          dispatchRealClick(el);
+          status(`Typing… ${i + 1}/${digits.length}`, "");
+          const via = await awaitRegistered(baseProgress, baseMut);
+          if (via) { registered = true; observable = true; if (via === "entry") entryMode = true; }
+        }
+
+        if (!registered) {
+          if (!observable) {
+            // Never any signal from this site — we can't tell an accepted tap from a dropped
+            // one. Assume the tap landed (as the old code always did) and finish with the blind,
+            // generous cadence. Latch `blind` so later digits skip the confirmation wait too.
+            blind = true;
+            if (i < digits.length - 1) await sleep(jitter(260, 160));
+            continue;
+          }
+          status(`Stuck at ${i}/${digits.length}: keypad kept dropping "${digits[i]}".`, "bad");
+          return false;
+        }
+
+        // Registered. Pre-space the NEXT click by whatever gap we've learned (0 = no throttle).
+        if (gap && i < digits.length - 1) await sleep(jitter(gap, 80));
+      }
+      status(`Typed ${digits.length} digit(s).`, "ok");
+      return true;
+    } finally {
+      probe.disconnect();
     }
-    status(`Typed ${digits.length} digit(s).`, "ok");
-    return true;
   }
 
   // ------------------------------------------------------------------ input bridge (UI)

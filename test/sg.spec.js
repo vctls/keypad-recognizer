@@ -82,4 +82,22 @@ test.describe("Société Générale stub — shared-sprite keypad", () => {
     });
     expect(entered).toBe("135790");
   });
+
+  // Regression: live SG DROPS taps spaced closer than ~250 ms (a debounced handler) yet still
+  // churns the DOM on every tap, and pipes accepted digits into #codeSecret while a numeric
+  // identifiant sits pre-filled in another field. Earlier adaptive pacing read only "did the DOM
+  // change?" (true even for dropped taps) and a max() entry-length (pinned by the numeric
+  // username) — so it never backed off and typed only ~3/6. The replayer must detect the drops
+  // via the GROWING field and self-tune its gap to land all six.
+  test("backs off on a debounced keypad and types all 6 digits", async ({ page }) => {
+    await setup(page, "sg-stub.html", { expected: "135790", debounce: "250", user: "12345678" });
+    await seedCacheFromSprite(page);
+    const r = await page.evaluate(async () => {
+      window.__stub__.reset();
+      await window.__KR__.typeSecret("135790", () => {});
+      return { entered: window.__stub__.entered, field: document.getElementById("codeSecret").value.length };
+    });
+    expect(r.entered).toBe("135790");
+    expect(r.field).toBe(6);
+  });
 });

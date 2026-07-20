@@ -70,6 +70,10 @@
       <div id="mask" style="display:flex;gap:12px"></div>
       <button class="delete" type="button" id="codeSecret-delete" aria-label="Effacer votre code secret">✕</button>
     </div>
+    <!-- The authoritative entry field SG keeps in sync with the mask (its value length is the
+         real count of accepted digits). Visually hidden; present so the reader can observe it. -->
+    <input id="codeSecret" type="password" autocomplete="off" aria-label="Code secret"
+           style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none" tabindex="-1">
 
     <div class="img-container" id="img_container">
       <img id="img_clavier" alt="" usemap="#tc_tclavier">
@@ -130,6 +134,16 @@
   const img = document.getElementById("img_clavier");
   const maskEl = document.getElementById("mask");
   const resultEl = document.getElementById("result");
+  const codeSecret = document.getElementById("codeSecret");
+  const userField = document.querySelector('input[name="user_id"]');
+
+  // Reproduce the two live SG conditions the replayer must survive (both opt-in via query so the
+  // default fixture is unchanged): ?debounce=<ms> drops any tap landing sooner than <ms> after
+  // the last ACCEPTED tap (SG's real handler); ?user=<digits> pre-fills the numeric identifiant
+  // (a red herring the entry-progress probe must not mistake for code progress).
+  const DEBOUNCE = parseInt(q.get("debounce") || "0", 10) || 0;
+  if (userField && q.get("user")) userField.value = q.get("user");
+  let lastAcceptAt = -Infinity;
 
   let entered = [];
 
@@ -141,14 +155,23 @@
       maskEl.appendChild(dot);
     }
   }
+  function syncField() { codeSecret.value = "•".repeat(entered.length); }
   function onKey(id) {
     const d = POS_TO_DIGIT[id];
     if (d == null) return;          // a blank cell — no digit
+    // Every tap flips a transient class on the key (like SG's :active/hover styling) so that a
+    // DROPPED tap still churns the DOM — this is what fooled a mutation-only "did it register?".
+    const key = document.getElementById("hover_touche_" + id);
+    if (key) { key.classList.toggle("kr-tapped"); }
+    const t = performance.now();
+    if (DEBOUNCE && t - lastAcceptAt < DEBOUNCE) return;   // too soon after last accept → dropped
+    lastAcceptAt = t;
     entered.push(d);
     window.__stub__.entered = entered.join("");
+    syncField();
     renderMask();
   }
-  function del() { entered.pop(); window.__stub__.entered = entered.join(""); renderMask(); }
+  function del() { entered.pop(); window.__stub__.entered = entered.join(""); syncField(); renderMask(); }
   function submit() {
     const got = entered.join("");
     window.__stub__.submitted = got;
@@ -183,7 +206,7 @@
       entered: "",
       submitted: null,
       expected: EXPECTED,
-      reset() { entered = []; window.__stub__.entered = ""; window.__stub__.submitted = null; resultEl.textContent = ""; renderMask(); },
+      reset() { entered = []; lastAcceptAt = -Infinity; window.__stub__.entered = ""; window.__stub__.submitted = null; resultEl.textContent = ""; syncField(); renderMask(); },
     };
   }
   img.addEventListener("load", publish);
